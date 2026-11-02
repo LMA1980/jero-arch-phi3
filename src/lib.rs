@@ -138,7 +138,8 @@ mod tests {
             ],
         };
 
-        let recipe = Phi3Recipe::new();
+        let mut recipe = Phi3Recipe::new();
+        recipe.num_layers = 1;
         let prompt = [10_u32, 20, 30];
         let mut logits = [0.0_f32; 16];
         let mut kv_cache = [0.0_f32; 64];
