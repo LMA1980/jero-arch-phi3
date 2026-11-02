@@ -188,16 +188,33 @@ impl Phi3Recipe {
                     let _v_view = qkv_tensor.slice_rows(row_q + row_kv, row_kv)?;
 
                     if q_view.quant() == QuantType::Q4_K_M && q_view.num_elements() >= 512 {
-                        let mut q_proj = [base_val; 2];
-                        #[cfg(feature = "with-kernels")]
-                        {
-                            BaselineKernel::new().vec_dot_q4_k_m(
-                                &mut q_proj,
-                                &q_view,
-                                &hidden[..256.min(hidden.len())],
-                            )?;
+                        let shape = q_view.shape();
+                        if shape.len() == 2 {
+                            let (rows, cols) = if shape[1] % 256 == 0 {
+                                (shape[0], shape[1])
+                            } else if shape[0] % 256 == 0 {
+                                (shape[1], shape[0])
+                            } else {
+                                (0, 0)
+                            };
+                            if rows > 0 && cols > 0 {
+                                let mut q_proj = vec![base_val; rows];
+                                let in_vec = vec![base_val; cols];
+                                #[cfg(feature = "with-kernels")]
+                                {
+                                    BaselineKernel::new().vec_dot_q4_k_m(
+                                        &mut q_proj,
+                                        &q_view,
+                                        &in_vec,
+                                    )?;
+                                }
+                                #[cfg(not(feature = "with-kernels"))]
+                                {
+                                    let _ = &mut q_proj;
+                                }
+                                hidden[0] = q_proj[0];
+                            }
                         }
-                        hidden[0] = q_proj[0];
                     }
                 }
             }
