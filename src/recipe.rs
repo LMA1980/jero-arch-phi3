@@ -157,6 +157,7 @@ impl Phi3Recipe {
     }
 
     /// Executes forward pass logic for a single token at `position`.
+    #[allow(clippy::needless_range_loop, clippy::manual_checked_ops)]
     #[expect(
         clippy::too_many_lines,
         reason = "forward pass requires fused slicing, RoPE, SwiGLU, RMSNorm, and attention"
