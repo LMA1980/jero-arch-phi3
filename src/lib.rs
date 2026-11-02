@@ -1,7 +1,7 @@
-//! `k3-arch-phi3`: Microsoft Phi architecture recipe for the SpacemiT K3 platform.
+//! `k3-arch-phi3`: Microsoft Phi architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Microsoft Phi-3 and Phi-4 models (`phi3`, `phi4`),
-//! supporting sliced fused QKV/MLP tensors and dynamic LongRoPE context switching.
+//! supporting sliced fused QKV/MLP tensors and dynamic `LongRoPE` context switching.
 
 use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType};
 
