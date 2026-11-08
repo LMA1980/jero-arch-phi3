@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-phi3 Release Pipeline"
+name: "jero-arch-phi3 Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always
