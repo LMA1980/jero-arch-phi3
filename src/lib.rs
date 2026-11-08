@@ -1,4 +1,4 @@
-//! `k3-arch-phi3`: Microsoft Phi architecture recipe for the `SpacemiT` K3 platform.
+//! `jero-arch-phi3`: Microsoft Phi architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Microsoft Phi-3 and Phi-4 models (`phi3`, `phi4`),
 //! supporting sliced fused QKV/MLP tensors and dynamic `LongRoPE` context switching.
@@ -10,7 +10,7 @@ pub use recipe::{Phi3Recipe, RopeScalingConfig};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+    use jero_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 
     struct TestWeights<'a> {
         tensors: Vec<(&'static str, TensorView<'a>)>,

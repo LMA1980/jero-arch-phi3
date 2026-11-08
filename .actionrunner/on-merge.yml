@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-phi3 Merge Pipeline"
+name: "jero-arch-phi3 Merge Pipeline"
 
 env:
   CARGO_TERM_COLOR: always

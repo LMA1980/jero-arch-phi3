@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-arch-phi3 Pull Request Verification Pipeline"
+name: "jero-arch-phi3 Pull Request Verification Pipeline"
 
 env:
   CARGO_TERM_COLOR: always
