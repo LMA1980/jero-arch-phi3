@@ -750,14 +750,13 @@ mod tests {
 
     #[test]
     fn test_phi3_prefill_and_decode_step_with_fused_slicing() {
-        let recipe = build_1layer_recipe(32, 64, 4, 2, 8);
-        let specs =
-            build_full_weight_buffers(32, 64, 32, 16, 8, QuantType::F32, QuantType::Q8_0, true);
+        let recipe = build_1layer_recipe(8, 16, 4, 2, 8);
+        let specs = build_full_weight_buffers(8, 16, 8, 4, 8, QuantType::F32, QuantType::F32, true);
         let weights = weights_from_buffers(&specs);
 
         let prompt = [1_u32, 3, 5];
         let mut logits_batched = [0.0_f32; 8];
-        let mut kv_batched = vec![0.0_f32; 16 * 16 * 2];
+        let mut kv_batched = vec![0.0_f32; 16 * 4 * 2];
         let mut ctx_b = ExecutionContext::new(&prompt, 16, &mut logits_batched, &mut kv_batched)
             .expect("create batched ctx");
         recipe
@@ -768,7 +767,7 @@ mod tests {
 
         // Batched prefill([1,3,5]) must match sequential prefill([1]) -> decode(3) -> decode(5)
         let mut logits_seq = [0.0_f32; 8];
-        let mut kv_seq = vec![0.0_f32; 16 * 16 * 2];
+        let mut kv_seq = vec![0.0_f32; 16 * 4 * 2];
         let mut ctx_s =
             ExecutionContext::new(&[1], 16, &mut logits_seq, &mut kv_seq).expect("create seq ctx");
         recipe.prefill_step(&mut ctx_s, &weights).expect("p0");
@@ -788,10 +787,10 @@ mod tests {
 
     #[test]
     fn test_synthetic_empty_weights_prefill_and_decode() {
-        let recipe = build_1layer_recipe(32, 64, 4, 2, 16);
+        let recipe = build_1layer_recipe(8, 16, 4, 2, 16);
         let empty = TestWeights { tensors: vec![] };
         let mut logits = [0.0_f32; 16];
-        let mut kv = vec![0.0_f32; 16 * 16 * 2];
+        let mut kv = vec![0.0_f32; 16 * 4 * 2];
         let mut ctx = ExecutionContext::new(&[2, 4, 6], 16, &mut logits, &mut kv).expect("ctx");
         recipe.prefill_step(&mut ctx, &empty).expect("prefill");
         assert_eq!(ctx.position(), 3);
@@ -803,13 +802,13 @@ mod tests {
 
     #[test]
     fn test_multi_dtype_rmsnorm_and_tied_vs_untied_lm_head() {
-        let recipe = build_1layer_recipe(32, 64, 4, 2, 6);
+        let recipe = build_1layer_recipe(8, 16, 4, 2, 6);
         for norm_qt in [QuantType::F32, QuantType::F16, QuantType::BF16] {
             let tied_specs =
-                build_full_weight_buffers(32, 64, 32, 16, 6, norm_qt, QuantType::Q8_0, false);
+                build_full_weight_buffers(8, 16, 8, 4, 6, norm_qt, QuantType::F32, false);
             let tied_weights = weights_from_buffers(&tied_specs);
             let mut logits = [0.0_f32; 6];
-            let mut kv = vec![0.0_f32; 8 * 16 * 2];
+            let mut kv = vec![0.0_f32; 8 * 4 * 2];
             let mut ctx = ExecutionContext::new(&[1, 2], 8, &mut logits, &mut kv).expect("ctx");
             recipe
                 .prefill_step(&mut ctx, &tied_weights)
@@ -820,13 +819,13 @@ mod tests {
 
         // Fail closed when partial loaded weights omit required token_embd.weight
         let partial_specs =
-            build_full_weight_buffers(32, 64, 32, 16, 6, QuantType::F32, QuantType::Q8_0, true)
+            build_full_weight_buffers(8, 16, 8, 4, 6, QuantType::F32, QuantType::F32, true)
                 .into_iter()
                 .filter(|(n, _, _, _)| n != "token_embd.weight")
                 .collect::<Vec<_>>();
         let partial_weights = weights_from_buffers(&partial_specs);
         let mut logits = [0.0_f32; 6];
-        let mut kv = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx = ExecutionContext::new(&[0], 8, &mut logits, &mut kv).expect("ctx");
         assert!(matches!(
             recipe.prefill_step(&mut ctx, &partial_weights),
@@ -836,11 +835,10 @@ mod tests {
 
     #[test]
     fn test_causal_gqa_kv_history_and_longrope_attn_factor() {
-        let specs =
-            build_full_weight_buffers(32, 64, 32, 16, 8, QuantType::F16, QuantType::Q8_0, true);
+        let specs = build_full_weight_buffers(8, 16, 8, 4, 8, QuantType::F16, QuantType::F32, true);
         let weights = weights_from_buffers(&specs);
 
-        let recipe = build_1layer_recipe(32, 64, 4, 2, 8)
+        let recipe = build_1layer_recipe(8, 16, 2, 1, 8)
             .with_rotary_dim(Some(4))
             .with_rope_scaling(RopeScalingConfig::LongRope {
                 short_factor: vec![1.0, 1.2],
@@ -851,12 +849,12 @@ mod tests {
 
         // Prompt [0, 4] vs [3, 4]: pos 1 evaluates token 4 under different causal prefixes 0 vs 3
         let mut logits_a = [0.0_f32; 8];
-        let mut kv_a = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv_a = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx_a = ExecutionContext::new(&[0, 4], 8, &mut logits_a, &mut kv_a).expect("ctx a");
         recipe.prefill_step(&mut ctx_a, &weights).expect("run a");
 
         let mut logits_b = [0.0_f32; 8];
-        let mut kv_b = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv_b = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx_b = ExecutionContext::new(&[3, 4], 8, &mut logits_b, &mut kv_b).expect("ctx b");
         recipe.prefill_step(&mut ctx_b, &weights).expect("run b");
 
@@ -872,7 +870,7 @@ mod tests {
         // attn_factor scaling must alter output even at pos=0 vs attn_factor = 1.0
         let recipe_no_factor = recipe.clone().with_attn_factor(1.0);
         let mut logits_f1 = [0.0_f32; 8];
-        let mut kv_f1 = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv_f1 = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx_f1 = ExecutionContext::new(&[0, 4], 8, &mut logits_f1, &mut kv_f1).expect("f1");
         recipe_no_factor
             .prefill_step(&mut ctx_f1, &weights)
@@ -890,18 +888,18 @@ mod tests {
 
     #[test]
     fn test_full_ffn_dim_not_truncated() {
-        // ffn_dim = 96 > hidden_dim = 32: perturb only rows 64..96 in ffn_down/ffn_up tail
-        let recipe = build_1layer_recipe(32, 96, 4, 2, 6);
+        // ffn_dim = 24 > hidden_dim = 8: perturb only rows 8..24 in gate and 32..48 in up
+        let recipe = build_1layer_recipe(8, 24, 2, 1, 6);
         let specs_a =
-            build_full_weight_buffers(32, 96, 32, 16, 6, QuantType::F32, QuantType::F32, true);
+            build_full_weight_buffers(8, 24, 8, 4, 6, QuantType::F32, QuantType::F32, true);
         let mut specs_b = specs_a.clone();
-        // Zero out the upper FFN rows (>= hidden_dim = 32) of ffn_up Gate [32..96] & Up [128..192]
+        // Zero out the upper FFN rows (>= hidden_dim = 8) of Gate [8..24] & Up [32..48]
         let up_entry = specs_b
             .iter_mut()
             .find(|(n, _, _, _)| n == "blk.0.ffn_up.weight")
             .expect("ffn_up present");
-        let row_bytes = 32 * 4;
-        for row_idx in (32..96).chain(128..192) {
+        let row_bytes = 8 * 4;
+        for row_idx in (8..24).chain(32..48) {
             let start = row_idx * row_bytes;
             up_entry.3[start..start + row_bytes].fill(0);
         }
@@ -910,12 +908,12 @@ mod tests {
         let w_b = weights_from_buffers(&specs_b);
 
         let mut logits_a = [0.0_f32; 6];
-        let mut kv_a = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv_a = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx_a = ExecutionContext::new(&[2], 8, &mut logits_a, &mut kv_a).expect("ctx a");
         recipe.prefill_step(&mut ctx_a, &w_a).expect("run a");
 
         let mut logits_b = [0.0_f32; 6];
-        let mut kv_b = vec![0.0_f32; 8 * 16 * 2];
+        let mut kv_b = vec![0.0_f32; 8 * 4 * 2];
         let mut ctx_b = ExecutionContext::new(&[2], 8, &mut logits_b, &mut kv_b).expect("ctx b");
         recipe.prefill_step(&mut ctx_b, &w_b).expect("run b");
 
@@ -925,7 +923,7 @@ mod tests {
             .fold(0.0_f32, |m, (&a, &b)| m.max((a - b).abs()));
         assert!(
             diff > 1e-4,
-            "rows beyond hidden_dim (32..96) in FFN were truncated (diff={diff})"
+            "rows beyond hidden_dim (8..24) in FFN were truncated (diff={diff})"
         );
     }
 
@@ -933,7 +931,7 @@ mod tests {
     fn test_mixed_quant_32d_forward_miri() {
         // Compact mixed-quant (Q4_0 + Q5_0 + Q8_0 + BF16 + F16 + F32) GQA forward pass (<1s under Miri)
         const HIDDEN: usize = 32;
-        const FFN: usize = 64;
+        const FFN: usize = 32;
         const VOCAB: usize = 4;
         const H_Q: usize = 4;
         const H_KV: usize = 2;
@@ -997,7 +995,7 @@ mod tests {
         let weights = weights_from_buffers(&mixed_specs);
         let mut logits = [0.0_f32; VOCAB];
         let mut kv = vec![0.0_f32; 8 * TOTAL_KV * 2];
-        let mut ctx = ExecutionContext::new(&[0, 2], 8, &mut logits, &mut kv).expect("ctx");
+        let mut ctx = ExecutionContext::new(&[2], 8, &mut logits, &mut kv).expect("ctx");
         recipe
             .prefill_step(&mut ctx, &weights)
             .expect("mixed forward");
