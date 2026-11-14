@@ -7,8 +7,16 @@
 
 pub(crate) mod quant;
 pub mod recipe;
+pub mod repack;
 
-pub use recipe::{Phi3Recipe, RopeScalingConfig};
+pub use recipe::{
+    PHI4_14B_VOCAB_SIZE, PHI4_MINI_VOCAB_SIZE, PHI35_PADDED_VOCAB_SIZE, Phi3Recipe, PhiChatDialect,
+    PhiStopMetadata, RopeScalingConfig,
+};
+pub use repack::{
+    Phi3LayerRepack, Phi3ModelRepack, Phi3RepackCache, Phi3SplitMatrix,
+    REPACK_TILE_ALIGNMENT_BYTES, REPACK_TILE_ROWS,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1001,5 +1009,426 @@ mod tests {
             .expect("mixed forward");
         assert!(logits.iter().all(|v| v.is_finite()));
         assert!(logits.iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(&x, &y)| x * y).sum();
+        let na: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|&y| y * y).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    }
+
+    fn argmax_idx(vals: &[f32]) -> usize {
+        vals.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map_or(0, |(idx, _)| idx)
+    }
+
+    fn pattern_f32(
+        idx: usize,
+        mul: usize,
+        add: usize,
+        modulus: usize,
+        center: f32,
+        scale: f32,
+    ) -> f32 {
+        let bucket = u8::try_from((idx * mul + add) % modulus).expect("modulus fits u8");
+        (f32::from(bucket) - center) * scale
+    }
+
+    type SyntheticTensorSpec = (String, QuantType, Vec<usize>, Vec<u8>);
+
+    fn build_gqa40_repack_specs(
+        q_dim: usize,
+        kv_dim: usize,
+        ffn: usize,
+        vocab: usize,
+    ) -> Vec<SyntheticTensorSpec> {
+        const HIDDEN: usize = 32;
+        let mut specs = Vec::new();
+        let embd_vals: Vec<f32> = (0..vocab * HIDDEN)
+            .map(|i| pattern_f32(i, 7, 3, 19, 9.0, 0.05))
+            .collect();
+        specs.push((
+            "token_embd.weight".to_owned(),
+            QuantType::F32,
+            vec![HIDDEN, vocab],
+            encode_f32_bytes(&embd_vals),
+        ));
+        specs.push((
+            "output_norm.weight".to_owned(),
+            QuantType::BF16,
+            vec![HIDDEN],
+            encode_bf16_bytes(&[1.0_f32; HIDDEN]),
+        ));
+        specs.push((
+            "blk.0.attn_norm.weight".to_owned(),
+            QuantType::F16,
+            vec![HIDDEN],
+            encode_f16_bytes(&[1.0_f32; HIDDEN]),
+        ));
+        specs.push((
+            "blk.0.ffn_norm.weight".to_owned(),
+            QuantType::F32,
+            vec![HIDDEN],
+            encode_f32_bytes(&[1.0_f32; HIDDEN]),
+        ));
+
+        let qkv_rows = q_dim + 2 * kv_dim;
+        let mut qkv_bytes = Vec::with_capacity(qkv_rows * 18);
+        for r in 0..qkv_rows {
+            let mut row = [0.0_f32; HIDDEN];
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = pattern_f32(r * 13 + c * 5, 1, 0, 23, 11.0, 0.04);
+            }
+            qkv_bytes.extend_from_slice(&encode_q4_0_block(&row));
+        }
+        specs.push((
+            "blk.0.attn_qkv.weight".to_owned(),
+            QuantType::Q4_0,
+            vec![HIDDEN, qkv_rows],
+            qkv_bytes,
+        ));
+
+        let o_flat: Vec<f32> = (0..HIDDEN)
+            .flat_map(|r| (0..q_dim).map(move |c| pattern_f32(r * 11 + c * 3, 1, 0, 17, 8.0, 0.03)))
+            .collect();
+        specs.push((
+            "blk.0.attn_output.weight".to_owned(),
+            QuantType::F16,
+            vec![q_dim, HIDDEN],
+            encode_f16_bytes(&o_flat),
+        ));
+
+        let gate_up_rows: Vec<Vec<f32>> = (0..2 * ffn)
+            .map(|r| {
+                (0..HIDDEN)
+                    .map(|c| pattern_f32(r * 17 + c * 7, 1, 0, 29, 14.0, 0.03))
+                    .collect()
+            })
+            .collect();
+        specs.push((
+            "blk.0.ffn_up.weight".to_owned(),
+            QuantType::Q8_0,
+            vec![HIDDEN, 2 * ffn],
+            encode_q8_0_rows(&gate_up_rows),
+        ));
+
+        let down_flat: Vec<f32> = (0..HIDDEN * ffn)
+            .map(|i| pattern_f32(i, 9, 1, 15, 7.0, 0.035))
+            .collect();
+        specs.push((
+            "blk.0.ffn_down.weight".to_owned(),
+            QuantType::BF16,
+            vec![ffn, HIDDEN],
+            encode_bf16_bytes(&down_flat),
+        ));
+        specs
+    }
+
+    fn assert_split_row_parity(
+        weights: &TestWeights,
+        cache: &Phi3ModelRepack,
+        hidden: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        ffn: usize,
+    ) {
+        assert_eq!(cache.layers().len(), 1);
+        let l0 = cache.layer(0).expect("layer 0");
+
+        assert_eq!(l0.wq().rows(), q_dim);
+        assert_eq!(l0.wq().n_tiles(), q_dim.div_ceil(REPACK_TILE_ROWS));
+        assert_eq!(l0.wk().rows(), kv_dim);
+        assert_eq!(l0.wk().n_tiles(), kv_dim.div_ceil(REPACK_TILE_ROWS));
+        assert_eq!(l0.wv().rows(), kv_dim);
+        assert_eq!(l0.wv().n_tiles(), kv_dim.div_ceil(REPACK_TILE_ROWS));
+        assert_eq!(l0.wgate().rows(), ffn);
+        assert_eq!(l0.wgate().n_tiles(), ffn.div_ceil(REPACK_TILE_ROWS));
+        assert_eq!(l0.wup().rows(), ffn);
+        assert_eq!(l0.wup().n_tiles(), ffn.div_ceil(REPACK_TILE_ROWS));
+        for mat in [
+            l0.wq(),
+            l0.wk(),
+            l0.wv(),
+            l0.wo(),
+            l0.wgate(),
+            l0.wup(),
+            l0.wdown(),
+        ] {
+            if mat.n_tiles() > 0 {
+                assert!(mat.is_128_byte_aligned(), "{} not 128B aligned", mat.name());
+            }
+        }
+
+        let qkv_view = weights.tensor("blk.0.attn_qkv.weight").expect("qkv view");
+        let mut raw_row = vec![0.0_f32; hidden];
+        let mut split_row = vec![0.0_f32; hidden];
+        for r in [0, 7, 8, kv_dim - 1] {
+            quant::dequantize_row_to_f32(&qkv_view, q_dim + r, hidden, &mut raw_row)
+                .expect("raw k row");
+            l0.wk().dequantize_row(r, &mut split_row).expect("wk row");
+            let max_k = raw_row
+                .iter()
+                .zip(&split_row)
+                .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(max_k <= 1e-5, "wk row {r} err={max_k}");
+
+            quant::dequantize_row_to_f32(&qkv_view, q_dim + kv_dim + r, hidden, &mut raw_row)
+                .expect("raw v row");
+            l0.wv().dequantize_row(r, &mut split_row).expect("wv row");
+            let max_v = raw_row
+                .iter()
+                .zip(&split_row)
+                .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(max_v <= 1e-5, "wv row {r} err={max_v}");
+        }
+
+        let up_view = weights.tensor("blk.0.ffn_up.weight").expect("up view");
+        for r in [0, 7, 8, ffn - 1] {
+            quant::dequantize_row_to_f32(&up_view, ffn + r, hidden, &mut raw_row)
+                .expect("raw up row");
+            l0.wup().dequantize_row(r, &mut split_row).expect("wup row");
+            let max_up = raw_row
+                .iter()
+                .zip(&split_row)
+                .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(max_up <= 1e-5, "wup row {r} err={max_up}");
+        }
+
+        assert_eq!(l0.attn_norm(), &vec![1.0_f32; hidden]);
+        assert_eq!(l0.ffn_norm(), &vec![1.0_f32; hidden]);
+        assert_eq!(cache.output_norm(), &vec![1.0_f32; hidden]);
+    }
+
+    #[test]
+    fn test_presplit_fused_qkv_and_gate_up_zero_straddling_and_repack_forward_miri() {
+        const HIDDEN: usize = 32;
+        const HEADS_Q: usize = 40;
+        const HEADS_KV: usize = 10;
+        const HEAD_DIM: usize = 2;
+        const Q_DIM: usize = HEADS_Q * HEAD_DIM;
+        const KV_DIM: usize = HEADS_KV * HEAD_DIM;
+        const FFN: usize = 12;
+        const VOCAB: usize = 8;
+
+        let mut recipe = Phi3Recipe::new();
+        recipe.num_layers = 1;
+        recipe.hidden_dim = HIDDEN;
+        recipe.ffn_dim = FFN;
+        recipe.n_heads_q = HEADS_Q;
+        recipe.n_heads_kv = HEADS_KV;
+        recipe.head_dim = HEAD_DIM;
+        recipe.rotary_dim = Some(HEAD_DIM);
+        recipe.vocab_size = VOCAB;
+
+        let specs = build_gqa40_repack_specs(Q_DIM, KV_DIM, FFN, VOCAB);
+        let weights = weights_from_buffers(&specs);
+        let cache = recipe.build_repack_cache(&weights).expect("build repack");
+        assert_split_row_parity(&weights, &cache, HIDDEN, Q_DIM, KV_DIM, FFN);
+
+        let mut logits_uncached = [0.0_f32; VOCAB];
+        let mut kv_uncached = vec![0.0_f32; 8 * KV_DIM * 2];
+        let mut ctx_u =
+            ExecutionContext::new(&[1, 3], 8, &mut logits_uncached, &mut kv_uncached).expect("u");
+        recipe
+            .prefill_step(&mut ctx_u, &weights)
+            .expect("u prefill");
+        ctx_u.prepare_decode(5).expect("u prep decode");
+        recipe.decode_step(&mut ctx_u, &weights).expect("u decode");
+
+        let mut logits_cached = [0.0_f32; VOCAB];
+        let mut kv_cached = vec![0.0_f32; 8 * KV_DIM * 2];
+        let mut ctx_c =
+            ExecutionContext::new(&[1, 3], 8, &mut logits_cached, &mut kv_cached).expect("c");
+        recipe
+            .prefill_step_with_repack(&mut ctx_c, &weights, &cache)
+            .expect("c prefill");
+        ctx_c.prepare_decode(5).expect("c prep decode");
+        recipe
+            .decode_step_with_repack(&mut ctx_c, &weights, &cache)
+            .expect("c decode");
+
+        let cos = cosine_sim(&logits_cached, &logits_uncached);
+        assert!(cos > 0.998, "repack decode cosine {cos} too low");
+        assert_eq!(argmax_idx(&logits_cached), argmax_idx(&logits_uncached));
+
+        let empty = TestWeights { tensors: vec![] };
+        assert!(matches!(
+            recipe.build_repack_cache(&empty),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_phi35_phi4_stop_metadata_and_dialect_handoff() {
+        use jero_core::StopReason;
+
+        let phi35_vocab_u32 = u32::try_from(PHI35_PADDED_VOCAB_SIZE).expect("fits u32");
+        let phi35_tokens = vec![
+            "<unk>",
+            "<s>",
+            "</s>",
+            "<|user|>",
+            "<|assistant|>",
+            "hello",
+            "<|end|>",
+            "<|endoftext|>",
+        ];
+        let phi35_kvs = [
+            ("phi3.vocab_size", GgufValue::Uint32(phi35_vocab_u32)),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(phi35_tokens)),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(6)),
+            (
+                "tokenizer.chat_template",
+                GgufValue::String(
+                    "{% for m in messages %}<|user|>{{m.content}}<|end|>{% endfor %}",
+                ),
+            ),
+        ];
+        let phi35_bytes = create_synthetic_gguf_v3_with_kvs("phi3", 32, &phi35_kvs, &[]);
+        let phi35_gguf = GgufFile::parse(&phi35_bytes).expect("parse phi35");
+        let phi35_recipe = Phi3Recipe::from_gguf(&phi35_gguf).expect("hydrate phi35");
+        assert_eq!(phi35_recipe.vocab_size, PHI35_PADDED_VOCAB_SIZE);
+        let phi35_stop = phi35_recipe
+            .extract_stop_metadata(&phi35_gguf)
+            .expect("stop metadata phi35");
+        assert_eq!(phi35_stop.dialect, PhiChatDialect::Phi3End);
+        assert_eq!(phi35_stop.end_token_id, Some(6));
+        assert!(phi35_stop.has_tied_lm_head);
+        assert!(phi35_stop.is_stop_token(6));
+        assert!(phi35_stop.is_stop_token(7));
+        let crit35 = phi35_stop.stop_criteria(16, 128);
+        assert_eq!(crit35.evaluate(5, 1, 2), None);
+        assert_eq!(crit35.evaluate(6, 2, 3), Some(StopReason::EosToken(6)));
+
+        let phi4_14b_u32 = u32::try_from(PHI4_14B_VOCAB_SIZE).expect("fits u32");
+        let phi4_tokens = vec![
+            "<unk>",
+            "ok",
+            "<|im_start|>",
+            "<|im_sep|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ];
+        let phi4_kvs = [
+            ("phi4.vocab_size", GgufValue::Uint32(phi4_14b_u32)),
+            ("phi4.embedding_length", GgufValue::Uint32(5120)),
+            ("phi4.attention.head_count", GgufValue::Uint32(40)),
+            ("phi4.attention.head_count_kv", GgufValue::Uint32(10)),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(phi4_tokens)),
+            ),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(4)),
+            (
+                "tokenizer.chat_template",
+                GgufValue::String("<|im_start|>user<|im_sep|>{{msg}}<|im_end|>"),
+            ),
+        ];
+        let phi4_bytes = create_synthetic_gguf_v3_with_kvs("phi4", 32, &phi4_kvs, &[]);
+        let phi4_gguf = GgufFile::parse(&phi4_bytes).expect("parse phi4");
+        let phi4_recipe = Phi3Recipe::from_gguf(&phi4_gguf).expect("hydrate phi4");
+        let phi4_stop = phi4_recipe
+            .extract_stop_metadata(&phi4_gguf)
+            .expect("stop metadata phi4");
+        assert_eq!(phi4_stop.vocab_size, PHI4_14B_VOCAB_SIZE);
+        assert_eq!(phi4_stop.dialect, PhiChatDialect::Phi4ImSep);
+        assert_eq!(phi4_stop.im_sep_token_id, Some(3));
+        assert_eq!(phi4_stop.im_end_token_id, Some(4));
+        let crit4 = phi4_stop.stop_criteria(16, 128);
+        assert_eq!(crit4.evaluate(3, 1, 2), Some(StopReason::EosToken(3)));
+        assert_eq!(crit4.evaluate(4, 1, 2), Some(StopReason::EosToken(4)));
+
+        let phi4_mini_u32 = u32::try_from(PHI4_MINI_VOCAB_SIZE).expect("fits u32");
+        let phi4_mini_kvs = [("phi3.vocab_size", GgufValue::Uint32(phi4_mini_u32))];
+        let phi4_mini_bytes = create_synthetic_gguf_v3_with_kvs("phi3", 32, &phi4_mini_kvs, &[]);
+        let phi4_mini_gguf = GgufFile::parse(&phi4_mini_bytes).expect("parse phi4 mini");
+        let phi4_mini_recipe = Phi3Recipe::from_gguf(&phi4_mini_gguf).expect("phi4 mini");
+        assert_eq!(phi4_mini_recipe.vocab_size, PHI4_MINI_VOCAB_SIZE);
+    }
+
+    #[test]
+    fn test_vocab_bounds_and_logits_mismatch_fail_closed() {
+        let bad_vocab_kvs = [
+            ("phi3.embedding_length", GgufValue::Uint32(4)),
+            ("phi3.vocab_size", GgufValue::Uint32(12)),
+        ];
+        let bad_vocab_bytes = create_synthetic_gguf_v3_with_kvs(
+            "phi3",
+            32,
+            &bad_vocab_kvs,
+            &[("token_embd.weight", QuantType::F32, &[4, 16])],
+        );
+        let bad_vocab_gguf = GgufFile::parse(&bad_vocab_bytes).expect("parse mismatch gguf");
+        assert!(matches!(
+            Phi3Recipe::from_gguf(&bad_vocab_gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let untied_diverge_bytes = create_synthetic_gguf_v3_with_kvs(
+            "phi3",
+            32,
+            &[("phi3.embedding_length", GgufValue::Uint32(4))],
+            &[
+                ("token_embd.weight", QuantType::F32, &[4, 16]),
+                ("output.weight", QuantType::F32, &[4, 12]),
+            ],
+        );
+        let untied_gguf = GgufFile::parse(&untied_diverge_bytes).expect("parse untied mismatch");
+        assert!(matches!(
+            Phi3Recipe::from_gguf(&untied_gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let oob_eos_kvs = [
+            ("phi3.vocab_size", GgufValue::Uint32(16)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(16)),
+        ];
+        let oob_eos_bytes = create_synthetic_gguf_v3_with_kvs("phi3", 32, &oob_eos_kvs, &[]);
+        let oob_eos_gguf = GgufFile::parse(&oob_eos_bytes).expect("parse oob eos");
+        assert!(matches!(
+            Phi3Recipe::from_gguf(&oob_eos_gguf),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let mut syn_recipe = Phi3Recipe::new();
+        syn_recipe.num_layers = 1;
+        syn_recipe.hidden_dim = 4;
+        syn_recipe.ffn_dim = 8;
+        syn_recipe.n_heads_q = 2;
+        syn_recipe.n_heads_kv = 2;
+        syn_recipe.head_dim = 2;
+        syn_recipe.rotary_dim = Some(2);
+        syn_recipe.vocab_size = 8;
+        let syn_weights = TestWeights { tensors: vec![] };
+
+        let total_kv = syn_recipe.n_heads_kv * syn_recipe.head_dim;
+        let mut kv_small = vec![0.0_f32; 8 * total_kv * 2];
+        let mut short_logits = [0.0_f32; 6];
+        let mut ctx_short =
+            ExecutionContext::new(&[1], 8, &mut short_logits, &mut kv_small).expect("short ctx");
+        assert!(matches!(
+            syn_recipe.prefill_step(&mut ctx_short, &syn_weights),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let mut kv_large = vec![0.0_f32; 8 * total_kv * 2];
+        let mut long_logits = [0.0_f32; 10];
+        let mut ctx_long =
+            ExecutionContext::new(&[1], 8, &mut long_logits, &mut kv_large).expect("long ctx");
+        assert!(matches!(
+            syn_recipe.prefill_step(&mut ctx_long, &syn_weights),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
     }
 }
