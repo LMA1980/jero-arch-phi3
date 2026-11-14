@@ -7,19 +7,22 @@
 
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, StopCriteria, TensorView,
+    ModelMetadata, ModelWeights, QuantType, ScratchScope, ScratchWorkspace, StopCriteria,
+    TensorView,
 };
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{QuantizedActQ8, RopeType, apply_rope_with_cos_sin};
+use jero_kernels_rvv::{QuantizedActQ8, QuantizedActQ8View, RopeType, apply_rope_with_cos_sin};
 
+#[cfg(feature = "with-kernels")]
+use crate::quant::{SharedQ8Input, project_matvec_shared_q8};
 use crate::quant::{
-    decode_1d_norm, dequantize_row_to_f32, dot_product_f32, gqa_attention_f32,
-    gqa_prefill_causal_f32, project_matvec, resolve_2d_dims, rmsnorm_batch_f32, rmsnorm_f32,
-    swiglu_layer_f32,
+    decode_1d_norm_into, dequantize_row_to_f32, dot_product_f32, gqa_attention_with_scratch_f32,
+    gqa_prefill_causal_f32, project_lm_head_parallel, project_matvec, resolve_2d_dims,
+    rmsnorm_batch_f32, rmsnorm_f32, swiglu_layer_f32, with_2d_rows_view,
 };
 #[cfg(feature = "with-kernels")]
 use crate::repack::get_or_repack_layer;
-use crate::repack::{Phi3LayerRepack, Phi3ModelRepack};
+use crate::repack::{Phi3LayerDescriptor, Phi3LayerRepack, Phi3ModelRepack};
 
 /// Canonical padded vocabulary size for `Phi-3` / `Phi-3.5-mini` models (`32,064`).
 pub const PHI35_PADDED_VOCAB_SIZE: usize = 32_064;
@@ -659,16 +662,24 @@ impl Phi3Recipe {
         Ok(())
     }
 
-    fn apply_rope_and_attn_factor(&self, heads_buf: &mut [f32], num_heads: usize, abs_pos: usize) {
+    fn apply_rope_pair_with_scratch(
+        &self,
+        q_buf: &mut [f32],
+        k_buf: &mut [f32],
+        abs_pos: usize,
+        cos_scratch: &mut [f32],
+        sin_scratch: &mut [f32],
+    ) {
         let rotary_dim = self.effective_rotary_dim();
         let half = rotary_dim / 2;
         if half == 0 {
             return;
         }
-        let mut cos = vec![0.0_f32; half];
-        let mut sin = vec![0.0_f32; half];
-        self.fill_long_rope_cos_sin(abs_pos, &mut cos, &mut sin);
-        let _ = self.apply_rope_with_table(heads_buf, num_heads, &cos, &sin);
+        let cos = &mut cos_scratch[..half];
+        let sin = &mut sin_scratch[..half];
+        self.fill_long_rope_cos_sin(abs_pos, cos, sin);
+        let _ = self.apply_rope_with_table(q_buf, self.n_heads_q, cos, sin);
+        let _ = self.apply_rope_with_table(k_buf, self.n_heads_kv, cos, sin);
     }
 
     fn apply_rope_batch(
@@ -711,7 +722,7 @@ impl Phi3Recipe {
         abs_pos: usize,
         weights: &dyn ModelWeights,
         kv_view: &mut KvCacheView<'_>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
         repack_cache: Option<&Phi3ModelRepack>,
     ) -> Result<(), K3Error> {
         let synthetic_mode = weights.tensor_count() == 0;
@@ -724,10 +735,10 @@ impl Phi3Recipe {
                     reason: "repack cache cannot be used with empty synthetic weights".to_owned(),
                 });
             }
-            synthesize_embedding(token_id, &mut workspace.hidden);
+            synthesize_embedding(token_id, workspace.hidden);
         } else {
             let embd_view = weights.tensor("token_embd.weight")?;
-            dequantize_row_to_f32(&embd_view, token_id as usize, hidden, &mut workspace.hidden)?;
+            dequantize_row_to_f32(&embd_view, token_id as usize, hidden, workspace.hidden)?;
         }
 
         for layer in 0..self.num_layers {
@@ -768,39 +779,45 @@ impl Phi3Recipe {
         layer: usize,
         abs_pos: usize,
         kv_view: &mut KvCacheView<'_>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
     ) -> Result<(), K3Error> {
         let total_kv = self.n_heads_kv * self.head_dim;
         #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
         let attn_scale = 1.0_f32 / (self.head_dim as f32).sqrt();
 
+        workspace.norm_w.fill(1.0_f32);
         rmsnorm_f32(
-            &mut workspace.normed,
-            &workspace.hidden,
-            &workspace.unit_norm,
+            workspace.normed,
+            workspace.hidden,
+            workspace.norm_w,
             self.rms_eps,
         )?;
         synthesize_qkv(
             layer,
-            &workspace.normed,
-            &mut workspace.q,
-            &mut workspace.k,
-            &mut workspace.v,
+            workspace.normed,
+            workspace.q,
+            workspace.k,
+            workspace.v,
         );
-        self.apply_rope_and_attn_factor(&mut workspace.q, self.n_heads_q, abs_pos);
-        self.apply_rope_and_attn_factor(&mut workspace.k, self.n_heads_kv, abs_pos);
+        self.apply_rope_pair_with_scratch(
+            workspace.q,
+            workspace.k,
+            abs_pos,
+            workspace.cos,
+            workspace.sin,
+        );
 
         {
             let (k_slot, v_slot) = kv_view.write_pos_range(layer, abs_pos)?;
-            k_slot.copy_from_slice(&workspace.k);
-            v_slot.copy_from_slice(&workspace.v);
+            k_slot.copy_from_slice(workspace.k);
+            v_slot.copy_from_slice(workspace.v);
         }
 
         let (k_valid, v_valid) = kv_view.valid_kv_range(layer, abs_pos + 1)?;
         let valid_seq_len = k_valid.len() / total_kv;
-        gqa_attention_f32(
-            &mut workspace.attn_out,
-            &workspace.q,
+        gqa_attention_with_scratch_f32(
+            workspace.attn_out,
+            workspace.q,
             k_valid,
             v_valid,
             self.n_heads_q,
@@ -808,23 +825,19 @@ impl Phi3Recipe {
             self.head_dim,
             valid_seq_len,
             attn_scale,
+            workspace.scores,
         )?;
 
-        accumulate_folded_proj(&workspace.attn_out, &mut workspace.hidden, 0.25);
+        accumulate_folded_proj(workspace.attn_out, workspace.hidden, 0.25);
         rmsnorm_f32(
-            &mut workspace.normed,
-            &workspace.hidden,
-            &workspace.unit_norm,
+            workspace.normed,
+            workspace.hidden,
+            workspace.norm_w,
             self.rms_eps,
         )?;
-        synthesize_gate_up(
-            self.ffn_dim,
-            &workspace.normed,
-            &mut workspace.gate,
-            &mut workspace.up,
-        );
-        swiglu_layer_f32(&mut workspace.ffn_act, &workspace.gate, &workspace.up)?;
-        accumulate_folded_proj(&workspace.ffn_act, &mut workspace.hidden, 0.25);
+        synthesize_gate_up(self.ffn_dim, workspace.normed, workspace.gate, workspace.up);
+        swiglu_layer_f32(workspace.ffn_act, workspace.gate, workspace.up)?;
+        accumulate_folded_proj(workspace.ffn_act, workspace.hidden, 0.25);
         Ok(())
     }
 
@@ -835,27 +848,33 @@ impl Phi3Recipe {
         weights: &dyn ModelWeights,
         layer_repack: Option<&Phi3LayerRepack>,
         kv_view: &mut KvCacheView<'_>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
     ) -> Result<(), K3Error> {
         let total_kv = self.n_heads_kv * self.head_dim;
         #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
         let attn_scale = 1.0_f32 / (self.head_dim as f32).sqrt();
+        let desc = Phi3LayerDescriptor::for_layer(layer);
 
-        self.project_layer_attn_qkv_into_ws(layer, weights, layer_repack, workspace)?;
-        self.apply_rope_and_attn_factor(&mut workspace.q, self.n_heads_q, abs_pos);
-        self.apply_rope_and_attn_factor(&mut workspace.k, self.n_heads_kv, abs_pos);
+        self.project_layer_attn_qkv_into_ws(&desc, weights, layer_repack, workspace)?;
+        self.apply_rope_pair_with_scratch(
+            workspace.q,
+            workspace.k,
+            abs_pos,
+            workspace.cos,
+            workspace.sin,
+        );
 
         {
             let (k_slot, v_slot) = kv_view.write_pos_range(layer, abs_pos)?;
-            k_slot.copy_from_slice(&workspace.k);
-            v_slot.copy_from_slice(&workspace.v);
+            k_slot.copy_from_slice(workspace.k);
+            v_slot.copy_from_slice(workspace.v);
         }
 
         let (k_valid, v_valid) = kv_view.valid_kv_range(layer, abs_pos + 1)?;
         let valid_seq_len = k_valid.len() / total_kv;
-        gqa_attention_f32(
-            &mut workspace.attn_out,
-            &workspace.q,
+        gqa_attention_with_scratch_f32(
+            workspace.attn_out,
+            workspace.q,
             k_valid,
             v_valid,
             self.n_heads_q,
@@ -863,126 +882,150 @@ impl Phi3Recipe {
             self.head_dim,
             valid_seq_len,
             attn_scale,
+            workspace.scores,
         )?;
 
-        Self::project_layer_attn_output_and_add(layer, weights, layer_repack, workspace)?;
-        self.project_layer_mlp_and_add(layer, weights, layer_repack, workspace)
+        Self::project_layer_attn_output_and_add(&desc, weights, layer_repack, workspace)?;
+        self.project_layer_mlp_and_add(&desc, weights, layer_repack, workspace)
     }
 
     fn project_layer_attn_qkv_into_ws(
         &self,
-        layer: usize,
+        desc: &Phi3LayerDescriptor,
         weights: &dyn ModelWeights,
         layer_repack: Option<&Phi3LayerRepack>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
     ) -> Result<(), K3Error> {
         let hidden = self.hidden_dim;
         let total_q = self.n_heads_q * self.head_dim;
         let total_kv = self.n_heads_kv * self.head_dim;
         if let Some(lr) = layer_repack {
             rmsnorm_f32(
-                &mut workspace.normed,
-                &workspace.hidden,
+                workspace.normed,
+                workspace.hidden,
                 lr.attn_norm(),
                 self.rms_eps,
             )?;
             project_repacked_qkv(lr, workspace)
         } else {
-            let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
-            let norm_view = weights.tensor(&attn_norm_name)?;
-            let norm_w = decode_1d_norm(&norm_view, hidden)?;
+            let norm_view = weights.tensor(desc.attn_norm())?;
+            decode_1d_norm_into(&norm_view, hidden, workspace.norm_w)?;
             rmsnorm_f32(
-                &mut workspace.normed,
-                &workspace.hidden,
-                &norm_w,
+                workspace.normed,
+                workspace.hidden,
+                workspace.norm_w,
                 self.rms_eps,
             )?;
             project_layer_qkv(
-                layer,
+                desc,
                 hidden,
                 total_q,
                 total_kv,
                 weights,
-                &workspace.normed,
-                &mut workspace.q,
-                &mut workspace.k,
-                &mut workspace.v,
+                workspace.normed,
+                workspace.q,
+                workspace.k,
+                workspace.v,
             )
         }
     }
 
     fn project_layer_attn_output_and_add(
-        layer: usize,
+        desc: &Phi3LayerDescriptor,
         weights: &dyn ModelWeights,
         layer_repack: Option<&Phi3LayerRepack>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
     ) -> Result<(), K3Error> {
         if let Some(lr) = layer_repack {
-            lr.wo()
-                .gemv(&mut workspace.proj_hidden, &workspace.attn_out)?;
+            #[cfg(feature = "with-kernels")]
+            {
+                let q_act =
+                    QuantizedActQ8View::quantize_row_in_scope(workspace.attn_out, workspace.scope)?;
+                lr.wo().gemv_view_parallel(workspace.proj_hidden, &q_act)?;
+            }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                lr.wo()
+                    .gemv_parallel(workspace.proj_hidden, workspace.attn_out)?;
+            }
         } else {
-            let o_name = format!("blk.{layer}.attn_output.weight");
-            let o_view = weights.tensor(&o_name)?;
-            project_matvec(&mut workspace.proj_hidden, &o_view, &workspace.attn_out)?;
+            let o_view = weights.tensor(desc.attn_output())?;
+            project_matvec(workspace.proj_hidden, &o_view, workspace.attn_out)?;
         }
-        add_residual_in_place(&mut workspace.hidden, &workspace.proj_hidden);
+        add_residual_in_place(workspace.hidden, workspace.proj_hidden);
         Ok(())
     }
 
     fn project_layer_mlp_and_add(
         &self,
-        layer: usize,
+        desc: &Phi3LayerDescriptor,
         weights: &dyn ModelWeights,
         layer_repack: Option<&Phi3LayerRepack>,
-        workspace: &mut ForwardWorkspace,
+        workspace: &mut DecodeScratch<'_, '_>,
     ) -> Result<(), K3Error> {
         let hidden = self.hidden_dim;
         if let Some(lr) = layer_repack {
             rmsnorm_f32(
-                &mut workspace.normed,
-                &workspace.hidden,
+                workspace.normed,
+                workspace.hidden,
                 lr.ffn_norm(),
                 self.rms_eps,
             )?;
             project_repacked_mlp_up(lr, workspace)?;
         } else {
-            let ffn_norm_w = load_ffn_norm(layer, hidden, weights)?;
+            load_ffn_norm_into(desc, hidden, weights, workspace.norm_w)?;
             rmsnorm_f32(
-                &mut workspace.normed,
-                &workspace.hidden,
-                &ffn_norm_w,
+                workspace.normed,
+                workspace.hidden,
+                workspace.norm_w,
                 self.rms_eps,
             )?;
             project_layer_mlp_up(
-                layer,
+                desc,
                 hidden,
                 self.ffn_dim,
                 weights,
-                &workspace.normed,
-                &mut workspace.gate,
-                &mut workspace.up,
+                workspace.normed,
+                workspace.gate,
+                workspace.up,
             )?;
         }
-        swiglu_layer_f32(&mut workspace.ffn_act, &workspace.gate, &workspace.up)?;
+        swiglu_layer_f32(workspace.ffn_act, workspace.gate, workspace.up)?;
         if let Some(lr) = layer_repack {
-            lr.wdown()
-                .gemv(&mut workspace.proj_hidden, &workspace.ffn_act)?;
+            #[cfg(feature = "with-kernels")]
+            {
+                let q_act =
+                    QuantizedActQ8View::quantize_row_in_scope(workspace.ffn_act, workspace.scope)?;
+                lr.wdown()
+                    .gemv_view_parallel(workspace.proj_hidden, &q_act)?;
+            }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                lr.wdown()
+                    .gemv_parallel(workspace.proj_hidden, workspace.ffn_act)?;
+            }
         } else {
-            let down_name = format!("blk.{layer}.ffn_down.weight");
-            let down_view = weights.tensor(&down_name)?;
-            project_matvec(&mut workspace.proj_hidden, &down_view, &workspace.ffn_act)?;
+            let down_view = weights.tensor(desc.ffn_down())?;
+            project_matvec(workspace.proj_hidden, &down_view, workspace.ffn_act)?;
         }
-        add_residual_in_place(&mut workspace.hidden, &workspace.proj_hidden);
+        add_residual_in_place(workspace.hidden, workspace.proj_hidden);
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "zero-allocation LM head logits helper borrows pre-allocated scratch slices explicitly"
+    )]
     fn write_lm_logits(
         &self,
         weights: &dyn ModelWeights,
         hidden_state: &[f32],
         normed_out: &mut [f32],
         logits_out: &mut [f32],
-        cached_output_norm: Option<&[f32]>,
+        repack_cache: Option<&Phi3ModelRepack>,
+        scratch_norm_w: &mut [f32],
+        scratch_probe: &mut [f32],
+        scratch_scope: Option<&ScratchScope<'_>>,
     ) -> Result<(), K3Error> {
         let hidden = self.hidden_dim;
         if logits_out.len() != self.vocab_size {
@@ -997,30 +1040,29 @@ impl Phi3Recipe {
         }
 
         if weights.tensor_count() == 0 {
-            let unit = vec![1.0_f32; hidden];
-            rmsnorm_f32(normed_out, hidden_state, &unit, self.rms_eps)?;
+            scratch_norm_w.fill(1.0_f32);
+            rmsnorm_f32(normed_out, hidden_state, scratch_norm_w, self.rms_eps)?;
             let norm_sum: f32 = normed_out.iter().sum();
             logits_out.fill(0.0);
             for (v, slot) in logits_out.iter_mut().enumerate().take(self.vocab_size) {
-                let mut probe = vec![0.0_f32; hidden];
-                synthesize_embedding(u32::try_from(v).unwrap_or(0), &mut probe);
-                *slot = dot_product_f32(normed_out, &probe) + norm_sum * 1.0e-3;
+                synthesize_embedding(u32::try_from(v).unwrap_or(0), scratch_probe);
+                *slot = dot_product_f32(normed_out, scratch_probe) + norm_sum * 1.0e-3;
             }
             return Ok(());
         }
 
-        if let Some(norm_w) = cached_output_norm {
-            rmsnorm_f32(normed_out, hidden_state, norm_w, self.rms_eps)?;
+        let lm_head_view = if let Some(cache) = repack_cache {
+            rmsnorm_f32(normed_out, hidden_state, cache.output_norm(), self.rms_eps)?;
+            weights.tensor(cache.lm_head_tensor_name())?
         } else {
             let out_norm_view = weights.tensor("output_norm.weight")?;
-            let out_norm_w = decode_1d_norm(&out_norm_view, hidden)?;
-            rmsnorm_f32(normed_out, hidden_state, &out_norm_w, self.rms_eps)?;
-        }
-
-        let lm_head_view = match weights.tensor("output.weight") {
-            Ok(view) => view,
-            Err(K3Error::TensorBoundsError { .. }) => weights.tensor("token_embd.weight")?,
-            Err(other) => return Err(other),
+            decode_1d_norm_into(&out_norm_view, hidden, scratch_norm_w)?;
+            rmsnorm_f32(normed_out, hidden_state, scratch_norm_w, self.rms_eps)?;
+            if weights.contains_tensor("output.weight") {
+                weights.tensor("output.weight")?
+            } else {
+                weights.tensor("token_embd.weight")?
+            }
         };
         let (lm_vocab, _) = resolve_2d_dims(&lm_head_view, hidden)?;
         if lm_vocab != self.vocab_size {
@@ -1034,7 +1076,7 @@ impl Phi3Recipe {
             });
         }
 
-        project_matvec(logits_out, &lm_head_view, normed_out)
+        project_lm_head_parallel(logits_out, &lm_head_view, normed_out, scratch_scope)
     }
 
     fn resolve_kv_geometry(&self, ctx: &ExecutionContext<'_>) -> Result<KvGeometry, K3Error> {
@@ -1235,82 +1277,94 @@ fn project_repacked_batch_mlp(
     }
 }
 
-struct ForwardWorkspace {
-    hidden: Vec<f32>,
-    normed: Vec<f32>,
-    proj_hidden: Vec<f32>,
-    unit_norm: Vec<f32>,
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    attn_out: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    ffn_act: Vec<f32>,
-    #[cfg(feature = "with-kernels")]
-    q_act: QuantizedActQ8,
+struct DecodeScratch<'a, 'b> {
+    hidden: &'a mut [f32],
+    normed: &'a mut [f32],
+    proj_hidden: &'a mut [f32],
+    norm_w: &'a mut [f32],
+    q: &'a mut [f32],
+    k: &'a mut [f32],
+    v: &'a mut [f32],
+    attn_out: &'a mut [f32],
+    gate: &'a mut [f32],
+    up: &'a mut [f32],
+    ffn_act: &'a mut [f32],
+    cos: &'a mut [f32],
+    sin: &'a mut [f32],
+    scores: &'a mut [f32],
+    #[cfg_attr(
+        not(feature = "with-kernels"),
+        expect(
+            dead_code,
+            reason = "only quantized Q8 scratch views consume DecodeScratch::scope"
+        )
+    )]
+    scope: &'a ScratchScope<'b>,
 }
 
-impl ForwardWorkspace {
-    fn new(recipe: &Phi3Recipe) -> Self {
+impl<'a, 'b> DecodeScratch<'a, 'b> {
+    fn lease(
+        recipe: &Phi3Recipe,
+        seq_len: usize,
+        scope: &'a ScratchScope<'b>,
+    ) -> Result<Self, K3Error> {
+        let hidden = recipe.hidden_dim;
         let total_q = recipe.n_heads_q * recipe.head_dim;
         let total_kv = recipe.n_heads_kv * recipe.head_dim;
-        Self {
-            hidden: vec![0.0_f32; recipe.hidden_dim],
-            normed: vec![0.0_f32; recipe.hidden_dim],
-            proj_hidden: vec![0.0_f32; recipe.hidden_dim],
-            unit_norm: vec![1.0_f32; recipe.hidden_dim],
-            q: vec![0.0_f32; total_q],
-            k: vec![0.0_f32; total_kv],
-            v: vec![0.0_f32; total_kv],
-            attn_out: vec![0.0_f32; total_q],
-            gate: vec![0.0_f32; recipe.ffn_dim],
-            up: vec![0.0_f32; recipe.ffn_dim],
-            ffn_act: vec![0.0_f32; recipe.ffn_dim],
-            #[cfg(feature = "with-kernels")]
-            q_act: QuantizedActQ8::new(),
-        }
+        let half_rot = (recipe.effective_rotary_dim() / 2).max(1);
+        Ok(Self {
+            hidden: scope.alloc_f32(hidden)?,
+            normed: scope.alloc_f32(hidden)?,
+            proj_hidden: scope.alloc_f32(hidden)?,
+            norm_w: scope.alloc_f32(hidden)?,
+            q: scope.alloc_f32(total_q)?,
+            k: scope.alloc_f32(total_kv)?,
+            v: scope.alloc_f32(total_kv)?,
+            attn_out: scope.alloc_f32(total_q)?,
+            gate: scope.alloc_f32(recipe.ffn_dim)?,
+            up: scope.alloc_f32(recipe.ffn_dim)?,
+            ffn_act: scope.alloc_f32(recipe.ffn_dim)?,
+            cos: scope.alloc_f32(half_rot)?,
+            sin: scope.alloc_f32(half_rot)?,
+            scores: scope.alloc_f32(seq_len.max(1))?,
+            scope,
+        })
     }
 }
 
 fn project_repacked_qkv(
     lr: &Phi3LayerRepack,
-    workspace: &mut ForwardWorkspace,
+    workspace: &mut DecodeScratch<'_, '_>,
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        workspace
-            .q_act
-            .quantize_into(&workspace.normed, 1, workspace.normed.len())?;
-        lr.wq().gemv_quantized(&mut workspace.q, &workspace.q_act)?;
-        lr.wk().gemv_quantized(&mut workspace.k, &workspace.q_act)?;
-        lr.wv().gemv_quantized(&mut workspace.v, &workspace.q_act)
+        let q_act = QuantizedActQ8View::quantize_row_in_scope(workspace.normed, workspace.scope)?;
+        lr.wq().gemv_view_parallel(workspace.q, &q_act)?;
+        lr.wk().gemv_view_parallel(workspace.k, &q_act)?;
+        lr.wv().gemv_view_parallel(workspace.v, &q_act)
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        lr.wq().gemv(&mut workspace.q, &workspace.normed)?;
-        lr.wk().gemv(&mut workspace.k, &workspace.normed)?;
-        lr.wv().gemv(&mut workspace.v, &workspace.normed)
+        lr.wq().gemv_parallel(workspace.q, workspace.normed)?;
+        lr.wk().gemv_parallel(workspace.k, workspace.normed)?;
+        lr.wv().gemv_parallel(workspace.v, workspace.normed)
     }
 }
 
 fn project_repacked_mlp_up(
     lr: &Phi3LayerRepack,
-    workspace: &mut ForwardWorkspace,
+    workspace: &mut DecodeScratch<'_, '_>,
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        workspace
-            .q_act
-            .quantize_into(&workspace.normed, 1, workspace.normed.len())?;
-        lr.wgate()
-            .gemv_quantized(&mut workspace.gate, &workspace.q_act)?;
-        lr.wup().gemv_quantized(&mut workspace.up, &workspace.q_act)
+        let q_act = QuantizedActQ8View::quantize_row_in_scope(workspace.normed, workspace.scope)?;
+        lr.wgate().gemv_view_parallel(workspace.gate, &q_act)?;
+        lr.wup().gemv_view_parallel(workspace.up, &q_act)
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        lr.wgate().gemv(&mut workspace.gate, &workspace.normed)?;
-        lr.wup().gemv(&mut workspace.up, &workspace.normed)
+        lr.wgate().gemv_parallel(workspace.gate, workspace.normed)?;
+        lr.wup().gemv_parallel(workspace.up, workspace.normed)
     }
 }
 
@@ -1510,7 +1564,67 @@ fn push_unique_stop_id(dst: &mut Vec<u32>, id: Option<u32>) {
     }
 }
 
+const fn aligned_f32_scratch_bytes(elems: usize) -> usize {
+    let bytes = elems.saturating_mul(size_of::<f32>());
+    if bytes == 0 {
+        128
+    } else {
+        bytes.div_ceil(128).saturating_mul(128)
+    }
+}
+
 impl Phi3Recipe {
+    /// Returns the pre-formatted stack-allocated tensor name descriptor for `layer` (`#33`).
+    #[must_use]
+    pub const fn layer_descriptor(layer: usize) -> Phi3LayerDescriptor {
+        Phi3LayerDescriptor::for_layer(layer)
+    }
+
+    /// Pre-builds all per-layer [`Phi3LayerDescriptor`] entries for `0..self.num_layers`.
+    #[must_use]
+    pub fn layer_descriptors(&self) -> Vec<Phi3LayerDescriptor> {
+        (0..self.num_layers)
+            .map(Phi3LayerDescriptor::for_layer)
+            .collect()
+    }
+
+    /// Returns the minimum `128-byte`-aligned [`ScratchWorkspace`] capacity (in bytes) required to
+    /// execute single-token `decode_step` up to `max_seq_len` cached tokens without heap
+    /// allocation (`#33`).
+    #[must_use]
+    pub const fn required_decode_scratch_bytes(&self, max_seq_len: usize) -> usize {
+        let total_q = self.n_heads_q.saturating_mul(self.head_dim);
+        let total_kv = self.n_heads_kv.saturating_mul(self.head_dim);
+        let rot_dim = match self.rotary_dim {
+            Some(rd) if rd > 0 && rd <= self.head_dim => rd,
+            _ => self.head_dim,
+        };
+        let half_rot = rot_dim / 2;
+        let half_rot_min = if half_rot == 0 { 1 } else { half_rot };
+        let seq_min = if max_seq_len == 0 { 1 } else { max_seq_len };
+        #[cfg(feature = "with-kernels")]
+        let act_view_headroom = {
+            let per_layer_act_view = QuantizedActQ8View::scratch_bytes_for_row(self.hidden_dim)
+                .saturating_mul(2)
+                .saturating_add(QuantizedActQ8View::scratch_bytes_for_row(total_q))
+                .saturating_add(QuantizedActQ8View::scratch_bytes_for_row(self.ffn_dim));
+            let lm_q8_headroom = self.hidden_dim.saturating_mul(2).saturating_add(512);
+            per_layer_act_view
+                .saturating_mul(self.num_layers)
+                .saturating_add(lm_q8_headroom)
+        };
+        #[cfg(not(feature = "with-kernels"))]
+        let act_view_headroom = 0_usize;
+        aligned_f32_scratch_bytes(self.hidden_dim)
+            .saturating_mul(4)
+            .saturating_add(aligned_f32_scratch_bytes(total_q).saturating_mul(2))
+            .saturating_add(aligned_f32_scratch_bytes(total_kv).saturating_mul(2))
+            .saturating_add(aligned_f32_scratch_bytes(self.ffn_dim).saturating_mul(3))
+            .saturating_add(aligned_f32_scratch_bytes(half_rot_min).saturating_mul(2))
+            .saturating_add(aligned_f32_scratch_bytes(seq_min))
+            .saturating_add(act_view_headroom)
+    }
+
     /// Validates runtime geometry and weight tensor shapes/quantizations against `self`.
     ///
     /// # Errors
@@ -1947,20 +2061,20 @@ impl Phi3Recipe {
         let total_kv = self.n_heads_kv * self.head_dim;
         let ffn_dim = self.ffn_dim;
 
-        let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
-        let attn_norm_view = weights.tensor(&attn_norm_name)?;
-        let attn_norm_w = decode_1d_norm(&attn_norm_view, hidden)?;
+        let desc = Phi3LayerDescriptor::for_layer(layer);
+        let attn_norm_view = weights.tensor(desc.attn_norm())?;
+        decode_1d_norm_into(&attn_norm_view, hidden, &mut ws.single_normed)?;
         rmsnorm_batch_f32(
             &mut ws.normed,
             &ws.hidden,
-            &attn_norm_w,
+            &ws.single_normed,
             m,
             hidden,
             self.rms_eps,
         )?;
         for t in 0..m {
             project_layer_qkv(
-                layer,
+                &desc,
                 hidden,
                 total_q,
                 total_kv,
@@ -1975,8 +2089,7 @@ impl Phi3Recipe {
         self.apply_rope_batch(&mut ws.q, &mut ws.k, m, start_pos, &mut ws.cos, &mut ws.sin)?;
         append_and_attend_layer_batch(self, layer, m, start_pos, end_pos, kv_view, ws)?;
 
-        let o_name = format!("blk.{layer}.attn_output.weight");
-        let o_view = weights.tensor(&o_name)?;
+        let o_view = weights.tensor(desc.attn_output())?;
         for t in 0..m {
             project_matvec(
                 &mut ws.proj_hidden[t * hidden..(t + 1) * hidden],
@@ -1986,18 +2099,18 @@ impl Phi3Recipe {
         }
         add_residual_in_place(&mut ws.hidden, &ws.proj_hidden);
 
-        let ffn_norm_w = load_ffn_norm(layer, hidden, weights)?;
+        load_ffn_norm_into(&desc, hidden, weights, &mut ws.single_normed)?;
         rmsnorm_batch_f32(
             &mut ws.normed,
             &ws.hidden,
-            &ffn_norm_w,
+            &ws.single_normed,
             m,
             hidden,
             self.rms_eps,
         )?;
         for t in 0..m {
             project_layer_mlp_up(
-                layer,
+                &desc,
                 hidden,
                 ffn_dim,
                 weights,
@@ -2008,8 +2121,7 @@ impl Phi3Recipe {
         }
         swiglu_layer_f32(&mut ws.ffn_act, &ws.gate, &ws.up)?;
 
-        let down_name = format!("blk.{layer}.ffn_down.weight");
-        let down_view = weights.tensor(&down_name)?;
+        let down_view = weights.tensor(desc.ffn_down())?;
         for t in 0..m {
             project_matvec(
                 &mut ws.proj_hidden[t * hidden..(t + 1) * hidden],
@@ -2113,7 +2225,6 @@ impl Phi3Recipe {
                 max_context_tokens: geom.seq_capacity,
             });
         }
-        let cached_out_norm = repack_cache.map(Phi3ModelRepack::output_norm);
         let mut ws = BatchPrefillWorkspace::new(self, m, end_pos);
         self.embed_prompt_batch(&prompt_tokens, weights, &mut ws.hidden)?;
 
@@ -2138,7 +2249,10 @@ impl Phi3Recipe {
                     &ws.hidden[last_offset..last_offset + self.hidden_dim],
                     &mut ws.single_normed,
                     logits_buf,
-                    cached_out_norm,
+                    repack_cache,
+                    &mut ws.normed[..self.hidden_dim],
+                    &mut ws.proj_hidden[..self.hidden_dim],
+                    None,
                 )?;
             }
         }
@@ -2168,30 +2282,71 @@ impl Phi3Recipe {
         }
 
         let geom = self.resolve_kv_geometry(ctx)?;
-        let cached_out_norm = repack_cache.map(Phi3ModelRepack::output_norm);
-        let mut workspace = ForwardWorkspace::new(self);
+        let required_scratch = self.required_decode_scratch_bytes(abs_pos + 1);
         {
-            let (logits_buf, kv_buf) = ctx.buffers_mut();
+            let (logits_buf, kv_buf, maybe_scratch) = ctx.buffers_and_scratch_mut();
             let mut kv_view = KvCacheView::new(kv_buf, geom)?;
-
-            self.forward_token(
-                token_id,
-                abs_pos,
-                weights,
-                &mut kv_view,
-                &mut workspace,
-                repack_cache,
-            )?;
-            self.write_lm_logits(
-                weights,
-                &workspace.hidden,
-                &mut workspace.normed,
-                logits_buf,
-                cached_out_norm,
-            )?;
+            if let Some(scratch) = maybe_scratch {
+                self.decode_step_with_scratch_inner(
+                    token_id,
+                    abs_pos,
+                    weights,
+                    repack_cache,
+                    &mut kv_view,
+                    logits_buf,
+                    scratch,
+                )?;
+            } else {
+                let mut fallback = ScratchWorkspace::new(required_scratch)?;
+                self.decode_step_with_scratch_inner(
+                    token_id,
+                    abs_pos,
+                    weights,
+                    repack_cache,
+                    &mut kv_view,
+                    logits_buf,
+                    &mut fallback,
+                )?;
+            }
         }
         ctx.advance_position(1)?;
         Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "single shared scratch decode path for caller-supplied and transient arenas"
+    )]
+    fn decode_step_with_scratch_inner(
+        &self,
+        token_id: u32,
+        abs_pos: usize,
+        weights: &dyn ModelWeights,
+        repack_cache: Option<&Phi3ModelRepack>,
+        kv_view: &mut KvCacheView<'_>,
+        logits_buf: &mut [f32],
+        scratch: &mut ScratchWorkspace,
+    ) -> Result<(), K3Error> {
+        let scope = scratch.scope();
+        let mut workspace = DecodeScratch::lease(self, abs_pos + 1, &scope)?;
+        self.forward_token(
+            token_id,
+            abs_pos,
+            weights,
+            kv_view,
+            &mut workspace,
+            repack_cache,
+        )?;
+        self.write_lm_logits(
+            weights,
+            workspace.hidden,
+            workspace.normed,
+            logits_buf,
+            repack_cache,
+            workspace.norm_w,
+            workspace.proj_hidden,
+            Some(&scope),
+        )
     }
 }
 
@@ -2253,6 +2408,7 @@ fn extract_positive_f32_vec(
     Ok(factors)
 }
 
+#[cfg(not(feature = "with-kernels"))]
 fn project_row_range(
     out: &mut [f32],
     tensor: &TensorView<'_>,
@@ -2275,51 +2431,40 @@ fn project_row_range(
             ),
         });
     }
-    let shape = tensor.shape();
-    if shape.len() != 2 {
+    with_2d_rows_view(tensor, row_start, row_count, expected_cols, |sliced| {
+        project_matvec(out, sliced, input)
+    })
+}
+
+#[cfg(feature = "with-kernels")]
+fn project_row_range_shared_q8(
+    out: &mut [f32],
+    tensor: &TensorView<'_>,
+    expected_cols: usize,
+    row_start: usize,
+    row_count: usize,
+    shared: &mut SharedQ8Input<'_>,
+) -> Result<(), K3Error> {
+    if out.len() != row_count {
         return Err(K3Error::TensorBoundsError {
             tensor_name: tensor.name().to_owned(),
             offset: tensor.offset(),
             byte_len: tensor.byte_len(),
             buffer_len: tensor.as_bytes().len(),
-            reason: format!("expected 2D tensor, got shape {shape:?}"),
+            reason: format!(
+                "row-slice projection buffer mismatch (out={}, row_count={row_count})",
+                out.len()
+            ),
         });
     }
-    if shape[0] == expected_cols {
-        let sliced = tensor.slice_rows(row_start, row_count)?;
-        return project_matvec(out, &sliced, input);
-    }
-    if shape[1] == expected_cols {
-        let total_rows = shape[0];
-        let end_row = row_start.saturating_add(row_count);
-        if end_row > total_rows {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: tensor.name().to_owned(),
-                offset: tensor.offset(),
-                byte_len: tensor.byte_len(),
-                buffer_len: tensor.as_bytes().len(),
-                reason: format!("row range {row_start}..{end_row} exceeds row count {total_rows}"),
-            });
-        }
-        let mut row_buf = vec![0.0_f32; expected_cols];
-        for (i, slot) in out.iter_mut().enumerate() {
-            dequantize_row_to_f32(tensor, row_start + i, expected_cols, &mut row_buf)?;
-            *slot = dot_product_f32(&row_buf, input);
-        }
-        return Ok(());
-    }
-    Err(K3Error::TensorBoundsError {
-        tensor_name: tensor.name().to_owned(),
-        offset: tensor.offset(),
-        byte_len: tensor.byte_len(),
-        buffer_len: tensor.as_bytes().len(),
-        reason: format!("2D shape {shape:?} does not match expected cols {expected_cols}"),
+    with_2d_rows_view(tensor, row_start, row_count, expected_cols, |sliced| {
+        project_matvec_shared_q8(out, sliced, shared)
     })
 }
 
 #[expect(clippy::too_many_arguments, reason = "explicit QKV slice projections")]
 fn project_layer_qkv(
-    layer: usize,
+    desc: &Phi3LayerDescriptor,
     hidden: usize,
     total_q: usize,
     total_kv: usize,
@@ -2329,22 +2474,37 @@ fn project_layer_qkv(
     k_out: &mut [f32],
     v_out: &mut [f32],
 ) -> Result<(), K3Error> {
-    let qkv_name = format!("blk.{layer}.attn_qkv.weight");
-    match weights.tensor(&qkv_name) {
-        Ok(qkv_view) => {
-            let (rows, _) = resolve_2d_dims(&qkv_view, hidden)?;
-            let expected_rows = total_q + 2 * total_kv;
-            if rows != expected_rows {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: qkv_name,
-                    offset: qkv_view.offset(),
-                    byte_len: qkv_view.byte_len(),
-                    buffer_len: qkv_view.as_bytes().len(),
-                    reason: format!(
-                        "fused attn_qkv rows {rows} != expected total_q + 2*total_kv ({expected_rows})"
-                    ),
-                });
-            }
+    if weights.contains_tensor(desc.attn_qkv()) {
+        let qkv_view = weights.tensor(desc.attn_qkv())?;
+        let (rows, _) = resolve_2d_dims(&qkv_view, hidden)?;
+        let expected_rows = total_q + 2 * total_kv;
+        if rows != expected_rows {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: desc.attn_qkv().to_owned(),
+                offset: qkv_view.offset(),
+                byte_len: qkv_view.byte_len(),
+                buffer_len: qkv_view.as_bytes().len(),
+                reason: format!(
+                    "fused attn_qkv rows {rows} != expected total_q + 2*total_kv ({expected_rows})"
+                ),
+            });
+        }
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut shared = SharedQ8Input::new(normed);
+            project_row_range_shared_q8(q_out, &qkv_view, hidden, 0, total_q, &mut shared)?;
+            project_row_range_shared_q8(k_out, &qkv_view, hidden, total_q, total_kv, &mut shared)?;
+            project_row_range_shared_q8(
+                v_out,
+                &qkv_view,
+                hidden,
+                total_q + total_kv,
+                total_kv,
+                &mut shared,
+            )
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
             project_row_range(q_out, &qkv_view, hidden, 0, total_q, normed)?;
             project_row_range(k_out, &qkv_view, hidden, total_q, total_kv, normed)?;
             project_row_range(
@@ -2356,20 +2516,28 @@ fn project_layer_qkv(
                 normed,
             )
         }
-        Err(K3Error::TensorBoundsError { .. }) => {
-            let q_view = weights.tensor(&format!("blk.{layer}.attn_q.weight"))?;
-            let k_view = weights.tensor(&format!("blk.{layer}.attn_k.weight"))?;
-            let v_view = weights.tensor(&format!("blk.{layer}.attn_v.weight"))?;
+    } else {
+        let q_view = weights.tensor(desc.attn_q())?;
+        let k_view = weights.tensor(desc.attn_k())?;
+        let v_view = weights.tensor(desc.attn_v())?;
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut shared = SharedQ8Input::new(normed);
+            project_matvec_shared_q8(q_out, &q_view, &mut shared)?;
+            project_matvec_shared_q8(k_out, &k_view, &mut shared)?;
+            project_matvec_shared_q8(v_out, &v_view, &mut shared)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
             project_matvec(q_out, &q_view, normed)?;
             project_matvec(k_out, &k_view, normed)?;
             project_matvec(v_out, &v_view, normed)
         }
-        Err(other) => Err(other),
     }
 }
 
 fn project_layer_mlp_up(
-    layer: usize,
+    desc: &Phi3LayerDescriptor,
     hidden: usize,
     ffn_dim: usize,
     weights: &dyn ModelWeights,
@@ -2377,19 +2545,36 @@ fn project_layer_mlp_up(
     gate_out: &mut [f32],
     up_out: &mut [f32],
 ) -> Result<(), K3Error> {
-    let fused_name = format!("blk.{layer}.ffn_up.weight");
-    let up_view = weights.tensor(&fused_name)?;
+    let up_view = weights.tensor(desc.ffn_up())?;
     let (rows, _) = resolve_2d_dims(&up_view, hidden)?;
     if rows == 2 * ffn_dim {
-        project_row_range(gate_out, &up_view, hidden, 0, ffn_dim, normed)?;
-        project_row_range(up_out, &up_view, hidden, ffn_dim, ffn_dim, normed)
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut shared = SharedQ8Input::new(normed);
+            project_row_range_shared_q8(gate_out, &up_view, hidden, 0, ffn_dim, &mut shared)?;
+            project_row_range_shared_q8(up_out, &up_view, hidden, ffn_dim, ffn_dim, &mut shared)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            project_row_range(gate_out, &up_view, hidden, 0, ffn_dim, normed)?;
+            project_row_range(up_out, &up_view, hidden, ffn_dim, ffn_dim, normed)
+        }
     } else if rows == ffn_dim {
-        let gate_view = weights.tensor(&format!("blk.{layer}.ffn_gate.weight"))?;
-        project_matvec(gate_out, &gate_view, normed)?;
-        project_matvec(up_out, &up_view, normed)
+        let gate_view = weights.tensor(desc.ffn_gate())?;
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut shared = SharedQ8Input::new(normed);
+            project_matvec_shared_q8(gate_out, &gate_view, &mut shared)?;
+            project_matvec_shared_q8(up_out, &up_view, &mut shared)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            project_matvec(gate_out, &gate_view, normed)?;
+            project_matvec(up_out, &up_view, normed)
+        }
     } else {
         Err(K3Error::TensorBoundsError {
-            tensor_name: fused_name,
+            tensor_name: desc.ffn_up().to_owned(),
             offset: up_view.offset(),
             byte_len: up_view.byte_len(),
             buffer_len: up_view.as_bytes().len(),
@@ -2401,21 +2586,18 @@ fn project_layer_mlp_up(
     }
 }
 
-fn load_ffn_norm(
-    layer: usize,
+fn load_ffn_norm_into(
+    desc: &Phi3LayerDescriptor,
     hidden: usize,
     weights: &dyn ModelWeights,
-) -> Result<Vec<f32>, K3Error> {
-    let primary = format!("blk.{layer}.ffn_norm.weight");
-    match weights.tensor(&primary) {
-        Ok(view) => decode_1d_norm(&view, hidden),
-        Err(K3Error::TensorBoundsError { .. }) => {
-            let alt = format!("blk.{layer}.post_attention_norm.weight");
-            let view = weights.tensor(&alt)?;
-            decode_1d_norm(&view, hidden)
-        }
-        Err(other) => Err(other),
-    }
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    let view = if weights.contains_tensor(desc.ffn_norm()) {
+        weights.tensor(desc.ffn_norm())?
+    } else {
+        weights.tensor(desc.post_attention_norm())?
+    };
+    decode_1d_norm_into(&view, hidden, out)
 }
 
 fn synthesize_embedding(token_id: u32, out: &mut [f32]) {
