@@ -10,12 +10,15 @@ use jero_core::{
     ModelMetadata, ModelWeights, QuantType, StopCriteria, TensorView,
 };
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::QuantizedActQ8;
+use jero_kernels_rvv::{QuantizedActQ8, RopeType, apply_rope_with_cos_sin};
 
 use crate::quant::{
-    decode_1d_norm, dequantize_row_to_f32, dot_product_f32, gqa_attention_f32, project_matvec,
-    resolve_2d_dims, rmsnorm_f32, swiglu_layer_f32,
+    decode_1d_norm, dequantize_row_to_f32, dot_product_f32, gqa_attention_f32,
+    gqa_prefill_causal_f32, project_matvec, resolve_2d_dims, rmsnorm_batch_f32, rmsnorm_f32,
+    swiglu_layer_f32,
 };
+#[cfg(feature = "with-kernels")]
+use crate::repack::get_or_repack_layer;
 use crate::repack::{Phi3LayerRepack, Phi3ModelRepack};
 
 /// Canonical padded vocabulary size for `Phi-3` / `Phi-3.5-mini` models (`32,064`).
@@ -583,7 +586,7 @@ impl Phi3Recipe {
         }
     }
 
-    fn apply_rope_and_attn_factor(&self, heads_buf: &mut [f32], num_heads: usize, abs_pos: usize) {
+    fn fill_long_rope_cos_sin(&self, abs_pos: usize, cos_out: &mut [f32], sin_out: &mut [f32]) {
         let rotary_dim = self.effective_rotary_dim();
         let half = rotary_dim / 2;
         if half == 0 {
@@ -600,22 +603,106 @@ impl Phi3Recipe {
         #[expect(clippy::cast_precision_loss, reason = "sequence position fits in f32")]
         let pos_f32 = abs_pos as f32;
 
+        for i in 0..half {
+            let ext = factors.map_or(linear_factor, |f| f[i]);
+            #[expect(clippy::cast_precision_loss, reason = "pair index fits in f32")]
+            let exponent = (2.0_f32 * (i as f32)) / rot_f32;
+            let inv_freq = 1.0_f32 / (self.rope_theta.powf(exponent) * ext);
+            let (sin_a, cos_a) = (pos_f32 * inv_freq).sin_cos();
+            cos_out[i] = cos_a * attn_scale;
+            sin_out[i] = sin_a * attn_scale;
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "with-kernels"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "with-kernels path delegates to fallible apply_rope_with_cos_sin"
+        )
+    )]
+    fn apply_rope_with_table(
+        &self,
+        heads_buf: &mut [f32],
+        num_heads: usize,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<(), K3Error> {
+        let rotary_dim = self.effective_rotary_dim();
+        let half = rotary_dim / 2;
+        if half == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "with-kernels")]
+        if rotary_dim % 2 == 0 {
+            return apply_rope_with_cos_sin(
+                heads_buf,
+                num_heads,
+                self.head_dim,
+                rotary_dim,
+                RopeType::NeoX,
+                cos,
+                sin,
+            );
+        }
         for h in 0..num_heads {
             let head = &mut heads_buf[h * self.head_dim..(h + 1) * self.head_dim];
             for i in 0..half {
-                let ext = factors.map_or(linear_factor, |f| f[i]);
-                #[expect(clippy::cast_precision_loss, reason = "pair index fits in f32")]
-                let exponent = (2.0_f32 * (i as f32)) / rot_f32;
-                let inv_freq = 1.0_f32 / (self.rope_theta.powf(exponent) * ext);
-                let (sin_a, cos_a) = (pos_f32 * inv_freq).sin_cos();
-                let c = cos_a * attn_scale;
-                let s = sin_a * attn_scale;
+                let c = cos[i];
+                let s = sin[i];
                 let x0 = head[i];
                 let x1 = head[i + half];
                 head[i] = x0 * c - x1 * s;
                 head[i + half] = x0 * s + x1 * c;
             }
         }
+        Ok(())
+    }
+
+    fn apply_rope_and_attn_factor(&self, heads_buf: &mut [f32], num_heads: usize, abs_pos: usize) {
+        let rotary_dim = self.effective_rotary_dim();
+        let half = rotary_dim / 2;
+        if half == 0 {
+            return;
+        }
+        let mut cos = vec![0.0_f32; half];
+        let mut sin = vec![0.0_f32; half];
+        self.fill_long_rope_cos_sin(abs_pos, &mut cos, &mut sin);
+        let _ = self.apply_rope_with_table(heads_buf, num_heads, &cos, &sin);
+    }
+
+    fn apply_rope_batch(
+        &self,
+        q_batch: &mut [f32],
+        k_batch: &mut [f32],
+        m: usize,
+        start_pos: usize,
+        cos_scratch: &mut [f32],
+        sin_scratch: &mut [f32],
+    ) -> Result<(), K3Error> {
+        let half = self.effective_rotary_dim() / 2;
+        if half == 0 {
+            return Ok(());
+        }
+        let total_q = self.n_heads_q * self.head_dim;
+        let total_kv = self.n_heads_kv * self.head_dim;
+        for m_idx in 0..m {
+            let abs_pos = start_pos + m_idx;
+            self.fill_long_rope_cos_sin(abs_pos, cos_scratch, sin_scratch);
+            self.apply_rope_with_table(
+                &mut q_batch[m_idx * total_q..(m_idx + 1) * total_q],
+                self.n_heads_q,
+                cos_scratch,
+                sin_scratch,
+            )?;
+            self.apply_rope_with_table(
+                &mut k_batch[m_idx * total_kv..(m_idx + 1) * total_kv],
+                self.n_heads_kv,
+                cos_scratch,
+                sin_scratch,
+            )?;
+        }
+        Ok(())
     }
 
     fn forward_token(
@@ -646,8 +733,22 @@ impl Phi3Recipe {
         for layer in 0..self.num_layers {
             if synthetic_mode {
                 self.forward_synthetic_layer(layer, abs_pos, kv_view, workspace)?;
+            } else if let Some(lr) = repack_cache.and_then(|cache| cache.layer(layer)) {
+                self.forward_authentic_layer(
+                    layer,
+                    abs_pos,
+                    weights,
+                    Some(lr),
+                    kv_view,
+                    workspace,
+                )?;
             } else {
-                let layer_repack = repack_cache.and_then(|cache| cache.layer(layer));
+                #[cfg(feature = "with-kernels")]
+                let cached_layer = get_or_repack_layer(self, layer, weights)?;
+                #[cfg(feature = "with-kernels")]
+                let layer_repack = Some(cached_layer.as_ref());
+                #[cfg(not(feature = "with-kernels"))]
+                let layer_repack = None;
                 self.forward_authentic_layer(
                     layer,
                     abs_pos,
@@ -964,6 +1065,173 @@ impl Phi3Recipe {
             ctx.n_ctx(),
             self.sliding_window,
         )
+    }
+}
+
+struct BatchPrefillWorkspace {
+    hidden: Vec<f32>,
+    normed: Vec<f32>,
+    proj_hidden: Vec<f32>,
+    single_normed: Vec<f32>,
+    unit_norm: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn_out: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn_act: Vec<f32>,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    scores_scratch: Vec<f32>,
+    #[cfg(feature = "with-kernels")]
+    q_act: QuantizedActQ8,
+}
+
+impl BatchPrefillWorkspace {
+    fn new(recipe: &Phi3Recipe, m: usize, end_pos: usize) -> Self {
+        let hidden = recipe.hidden_dim;
+        let total_q = recipe.n_heads_q * recipe.head_dim;
+        let total_kv = recipe.n_heads_kv * recipe.head_dim;
+        let half_rot = recipe.effective_rotary_dim() / 2;
+        let scratch_len = recipe
+            .sliding_window
+            .map_or(end_pos, |w| w.min(end_pos))
+            .max(1);
+        Self {
+            hidden: vec![0.0_f32; m * hidden],
+            normed: vec![0.0_f32; m * hidden],
+            proj_hidden: vec![0.0_f32; m * hidden],
+            single_normed: vec![0.0_f32; hidden],
+            unit_norm: vec![1.0_f32; hidden],
+            q: vec![0.0_f32; m * total_q],
+            k: vec![0.0_f32; m * total_kv],
+            v: vec![0.0_f32; m * total_kv],
+            attn_out: vec![0.0_f32; m * total_q],
+            gate: vec![0.0_f32; m * recipe.ffn_dim],
+            up: vec![0.0_f32; m * recipe.ffn_dim],
+            ffn_act: vec![0.0_f32; m * recipe.ffn_dim],
+            cos: vec![0.0_f32; half_rot],
+            sin: vec![0.0_f32; half_rot],
+            scores_scratch: vec![0.0_f32; scratch_len],
+            #[cfg(feature = "with-kernels")]
+            q_act: QuantizedActQ8::new(),
+        }
+    }
+}
+
+fn append_and_attend_layer_batch(
+    recipe: &Phi3Recipe,
+    layer: usize,
+    m: usize,
+    start_pos: usize,
+    end_pos: usize,
+    kv_view: &mut KvCacheView<'_>,
+    ws: &mut BatchPrefillWorkspace,
+) -> Result<(), K3Error> {
+    let total_kv = recipe.n_heads_kv * recipe.head_dim;
+    #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
+    let attn_scale = 1.0_f32 / (recipe.head_dim as f32).sqrt();
+    let kv_start = start_pos * total_kv;
+    let kv_end = end_pos * total_kv;
+    let (k_plane, v_plane) = kv_view.layer_kv_mut(layer)?;
+    let (Some(k_dst), Some(v_dst)) = (
+        k_plane.get_mut(kv_start..kv_end),
+        v_plane.get_mut(kv_start..kv_end),
+    ) else {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: kv_start,
+            byte_len: (kv_end - kv_start) * size_of::<f32>(),
+            buffer_len: k_plane.len().min(v_plane.len()) * size_of::<f32>(),
+            reason: format!(
+                "layer {layer} KV slice [{kv_start}..{kv_end}) exceeds plane length ({})",
+                k_plane.len()
+            ),
+        });
+    };
+    k_dst.copy_from_slice(&ws.k);
+    v_dst.copy_from_slice(&ws.v);
+    gqa_prefill_causal_f32(
+        &mut ws.attn_out,
+        &ws.q,
+        &k_plane[..kv_end],
+        &v_plane[..kv_end],
+        m,
+        recipe.n_heads_q,
+        recipe.n_heads_kv,
+        recipe.head_dim,
+        end_pos,
+        start_pos,
+        recipe.sliding_window,
+        attn_scale,
+        &mut ws.scores_scratch,
+    )
+}
+
+fn project_repacked_batch_qkv(
+    lr: &Phi3LayerRepack,
+    m: usize,
+    ws: &mut BatchPrefillWorkspace,
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let hidden = lr.wq().cols();
+        ws.q_act.quantize_into(&ws.normed, m, hidden)?;
+        lr.wq().gemm_quantized_parallel(&mut ws.q, &ws.q_act, m)?;
+        lr.wk().gemm_quantized_parallel(&mut ws.k, &ws.q_act, m)?;
+        lr.wv().gemm_quantized_parallel(&mut ws.v, &ws.q_act, m)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        lr.wq().gemm(&mut ws.q, &ws.normed, m)?;
+        lr.wk().gemm(&mut ws.k, &ws.normed, m)?;
+        lr.wv().gemm(&mut ws.v, &ws.normed, m)
+    }
+}
+
+fn project_repacked_batch_o(
+    lr: &Phi3LayerRepack,
+    m: usize,
+    ws: &mut BatchPrefillWorkspace,
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let total_q = lr.wo().cols();
+        ws.q_act.quantize_into(&ws.attn_out, m, total_q)?;
+        lr.wo()
+            .gemm_quantized_parallel(&mut ws.proj_hidden, &ws.q_act, m)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        lr.wo().gemm(&mut ws.proj_hidden, &ws.attn_out, m)
+    }
+}
+
+fn project_repacked_batch_mlp(
+    lr: &Phi3LayerRepack,
+    m: usize,
+    ws: &mut BatchPrefillWorkspace,
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let hidden = lr.wgate().cols();
+        let ffn_dim = lr.wdown().cols();
+        ws.q_act.quantize_into(&ws.normed, m, hidden)?;
+        lr.wgate()
+            .gemm_quantized_parallel(&mut ws.gate, &ws.q_act, m)?;
+        lr.wup().gemm_quantized_parallel(&mut ws.up, &ws.q_act, m)?;
+        swiglu_layer_f32(&mut ws.ffn_act, &ws.gate, &ws.up)?;
+        ws.q_act.quantize_into(&ws.ffn_act, m, ffn_dim)?;
+        lr.wdown()
+            .gemm_quantized_parallel(&mut ws.proj_hidden, &ws.q_act, m)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        lr.wgate().gemm(&mut ws.gate, &ws.normed, m)?;
+        lr.wup().gemm(&mut ws.up, &ws.normed, m)?;
+        swiglu_layer_f32(&mut ws.ffn_act, &ws.gate, &ws.up)?;
+        lr.wdown().gemm(&mut ws.proj_hidden, &ws.ffn_act, m)
     }
 }
 
@@ -1518,6 +1786,287 @@ impl Phi3Recipe {
         self.decode_step_inner(ctx, weights, Some(cache))
     }
 
+    fn embed_prompt_batch(
+        &self,
+        prompt_tokens: &[u32],
+        weights: &dyn ModelWeights,
+        hidden_batch: &mut [f32],
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        if weights.tensor_count() == 0 {
+            for (t, &token_id) in prompt_tokens.iter().enumerate() {
+                synthesize_embedding(token_id, &mut hidden_batch[t * hidden..(t + 1) * hidden]);
+            }
+            return Ok(());
+        }
+
+        let embd_view = weights.tensor("token_embd.weight")?;
+        for (t, &token_id) in prompt_tokens.iter().enumerate() {
+            dequantize_row_to_f32(
+                &embd_view,
+                token_id as usize,
+                hidden,
+                &mut hidden_batch[t * hidden..(t + 1) * hidden],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "batched prefill layer passes bounds and KV view explicitly"
+    )]
+    fn forward_synthetic_prefill_layer(
+        &self,
+        layer: usize,
+        m: usize,
+        start_pos: usize,
+        end_pos: usize,
+        kv_view: &mut KvCacheView<'_>,
+        ws: &mut BatchPrefillWorkspace,
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        let total_q = self.n_heads_q * self.head_dim;
+        let total_kv = self.n_heads_kv * self.head_dim;
+        let ffn_dim = self.ffn_dim;
+
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            &ws.unit_norm,
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        for t in 0..m {
+            synthesize_qkv(
+                layer,
+                &ws.normed[t * hidden..(t + 1) * hidden],
+                &mut ws.q[t * total_q..(t + 1) * total_q],
+                &mut ws.k[t * total_kv..(t + 1) * total_kv],
+                &mut ws.v[t * total_kv..(t + 1) * total_kv],
+            );
+        }
+        self.apply_rope_batch(&mut ws.q, &mut ws.k, m, start_pos, &mut ws.cos, &mut ws.sin)?;
+        append_and_attend_layer_batch(self, layer, m, start_pos, end_pos, kv_view, ws)?;
+
+        for t in 0..m {
+            accumulate_folded_proj(
+                &ws.attn_out[t * total_q..(t + 1) * total_q],
+                &mut ws.hidden[t * hidden..(t + 1) * hidden],
+                0.25,
+            );
+        }
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            &ws.unit_norm,
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        for t in 0..m {
+            synthesize_gate_up(
+                ffn_dim,
+                &ws.normed[t * hidden..(t + 1) * hidden],
+                &mut ws.gate[t * ffn_dim..(t + 1) * ffn_dim],
+                &mut ws.up[t * ffn_dim..(t + 1) * ffn_dim],
+            );
+        }
+        swiglu_layer_f32(&mut ws.ffn_act, &ws.gate, &ws.up)?;
+        for t in 0..m {
+            accumulate_folded_proj(
+                &ws.ffn_act[t * ffn_dim..(t + 1) * ffn_dim],
+                &mut ws.hidden[t * hidden..(t + 1) * hidden],
+                0.25,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "batched prefill layer passes repacked weights and bounds explicitly"
+    )]
+    fn forward_repacked_prefill_layer(
+        &self,
+        layer: usize,
+        lr: &Phi3LayerRepack,
+        m: usize,
+        start_pos: usize,
+        end_pos: usize,
+        kv_view: &mut KvCacheView<'_>,
+        ws: &mut BatchPrefillWorkspace,
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            lr.attn_norm(),
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        project_repacked_batch_qkv(lr, m, ws)?;
+        self.apply_rope_batch(&mut ws.q, &mut ws.k, m, start_pos, &mut ws.cos, &mut ws.sin)?;
+        append_and_attend_layer_batch(self, layer, m, start_pos, end_pos, kv_view, ws)?;
+
+        project_repacked_batch_o(lr, m, ws)?;
+        add_residual_in_place(&mut ws.hidden, &ws.proj_hidden);
+
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            lr.ffn_norm(),
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        project_repacked_batch_mlp(lr, m, ws)?;
+        add_residual_in_place(&mut ws.hidden, &ws.proj_hidden);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "with-kernels"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "portable scalar prefill fallback passes weights and bounds explicitly"
+    )]
+    fn forward_scalar_prefill_layer(
+        &self,
+        layer: usize,
+        weights: &dyn ModelWeights,
+        m: usize,
+        start_pos: usize,
+        end_pos: usize,
+        kv_view: &mut KvCacheView<'_>,
+        ws: &mut BatchPrefillWorkspace,
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        let total_q = self.n_heads_q * self.head_dim;
+        let total_kv = self.n_heads_kv * self.head_dim;
+        let ffn_dim = self.ffn_dim;
+
+        let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
+        let attn_norm_view = weights.tensor(&attn_norm_name)?;
+        let attn_norm_w = decode_1d_norm(&attn_norm_view, hidden)?;
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            &attn_norm_w,
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        for t in 0..m {
+            project_layer_qkv(
+                layer,
+                hidden,
+                total_q,
+                total_kv,
+                weights,
+                &ws.normed[t * hidden..(t + 1) * hidden],
+                &mut ws.q[t * total_q..(t + 1) * total_q],
+                &mut ws.k[t * total_kv..(t + 1) * total_kv],
+                &mut ws.v[t * total_kv..(t + 1) * total_kv],
+            )?;
+        }
+
+        self.apply_rope_batch(&mut ws.q, &mut ws.k, m, start_pos, &mut ws.cos, &mut ws.sin)?;
+        append_and_attend_layer_batch(self, layer, m, start_pos, end_pos, kv_view, ws)?;
+
+        let o_name = format!("blk.{layer}.attn_output.weight");
+        let o_view = weights.tensor(&o_name)?;
+        for t in 0..m {
+            project_matvec(
+                &mut ws.proj_hidden[t * hidden..(t + 1) * hidden],
+                &o_view,
+                &ws.attn_out[t * total_q..(t + 1) * total_q],
+            )?;
+        }
+        add_residual_in_place(&mut ws.hidden, &ws.proj_hidden);
+
+        let ffn_norm_w = load_ffn_norm(layer, hidden, weights)?;
+        rmsnorm_batch_f32(
+            &mut ws.normed,
+            &ws.hidden,
+            &ffn_norm_w,
+            m,
+            hidden,
+            self.rms_eps,
+        )?;
+        for t in 0..m {
+            project_layer_mlp_up(
+                layer,
+                hidden,
+                ffn_dim,
+                weights,
+                &ws.normed[t * hidden..(t + 1) * hidden],
+                &mut ws.gate[t * ffn_dim..(t + 1) * ffn_dim],
+                &mut ws.up[t * ffn_dim..(t + 1) * ffn_dim],
+            )?;
+        }
+        swiglu_layer_f32(&mut ws.ffn_act, &ws.gate, &ws.up)?;
+
+        let down_name = format!("blk.{layer}.ffn_down.weight");
+        let down_view = weights.tensor(&down_name)?;
+        for t in 0..m {
+            project_matvec(
+                &mut ws.proj_hidden[t * hidden..(t + 1) * hidden],
+                &down_view,
+                &ws.ffn_act[t * ffn_dim..(t + 1) * ffn_dim],
+            )?;
+        }
+        add_residual_in_place(&mut ws.hidden, &ws.proj_hidden);
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "batched layer loop keeps synthetic, cached, and auto-repack dispatch cohesive"
+    )]
+    fn forward_prefill_layers(
+        &self,
+        synthetic_mode: bool,
+        weights: &dyn ModelWeights,
+        repack_cache: Option<&Phi3ModelRepack>,
+        m: usize,
+        start_pos: usize,
+        end_pos: usize,
+        kv_view: &mut KvCacheView<'_>,
+        ws: &mut BatchPrefillWorkspace,
+    ) -> Result<(), K3Error> {
+        for layer in 0..self.num_layers {
+            if synthetic_mode {
+                self.forward_synthetic_prefill_layer(layer, m, start_pos, end_pos, kv_view, ws)?;
+            } else if let Some(cache) = repack_cache {
+                let lr = cache
+                    .layer(layer)
+                    .ok_or_else(|| K3Error::CapabilityMismatch {
+                        architecture: self.architecture.to_owned(),
+                        reason: format!("repack cache missing layer {layer}"),
+                    })?;
+                self.forward_repacked_prefill_layer(layer, lr, m, start_pos, end_pos, kv_view, ws)?;
+            } else {
+                #[cfg(feature = "with-kernels")]
+                {
+                    let lr = get_or_repack_layer(self, layer, weights)?;
+                    self.forward_repacked_prefill_layer(
+                        layer, &lr, m, start_pos, end_pos, kv_view, ws,
+                    )?;
+                }
+                #[cfg(not(feature = "with-kernels"))]
+                {
+                    let _ = self;
+                    self.forward_scalar_prefill_layer(
+                        layer, weights, m, start_pos, end_pos, kv_view, ws,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn prefill_step_inner(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -1533,14 +2082,14 @@ impl Phi3Recipe {
         }
 
         let prompt_tokens: Vec<u32> = ctx.prompt_tokens().to_vec();
+        let m = prompt_tokens.len();
         let start_pos = ctx.position();
-        let end_pos =
-            start_pos
-                .checked_add(prompt_tokens.len())
-                .ok_or(K3Error::ContextLengthExceeded {
-                    requested_tokens: usize::MAX,
-                    max_context_tokens: ctx.n_ctx(),
-                })?;
+        let end_pos = start_pos
+            .checked_add(m)
+            .ok_or(K3Error::ContextLengthExceeded {
+                requested_tokens: usize::MAX,
+                max_context_tokens: ctx.n_ctx(),
+            })?;
         if end_pos > ctx.n_ctx() {
             return Err(K3Error::ContextLengthExceeded {
                 requested_tokens: end_pos,
@@ -1548,33 +2097,52 @@ impl Phi3Recipe {
             });
         }
 
+        let synthetic_mode = weights.tensor_count() == 0;
+        if synthetic_mode && repack_cache.is_some() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: "repack cache cannot be used with empty synthetic weights".to_owned(),
+            });
+        }
+
+        let compute_logits = ctx.compute_logits();
         let geom = self.resolve_kv_geometry(ctx)?;
+        if end_pos > geom.seq_capacity {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: geom.seq_capacity,
+            });
+        }
         let cached_out_norm = repack_cache.map(Phi3ModelRepack::output_norm);
-        let mut workspace = ForwardWorkspace::new(self);
+        let mut ws = BatchPrefillWorkspace::new(self, m, end_pos);
+        self.embed_prompt_batch(&prompt_tokens, weights, &mut ws.hidden)?;
+
         {
             let (logits_buf, kv_buf) = ctx.buffers_mut();
             let mut kv_view = KvCacheView::new(kv_buf, geom)?;
+            self.forward_prefill_layers(
+                synthetic_mode,
+                weights,
+                repack_cache,
+                m,
+                start_pos,
+                end_pos,
+                &mut kv_view,
+                &mut ws,
+            )?;
 
-            for (offset, &token_id) in prompt_tokens.iter().enumerate() {
-                self.forward_token(
-                    token_id,
-                    start_pos + offset,
+            if compute_logits {
+                let last_offset = (m - 1) * self.hidden_dim;
+                self.write_lm_logits(
                     weights,
-                    &mut kv_view,
-                    &mut workspace,
-                    repack_cache,
+                    &ws.hidden[last_offset..last_offset + self.hidden_dim],
+                    &mut ws.single_normed,
+                    logits_buf,
+                    cached_out_norm,
                 )?;
             }
-
-            self.write_lm_logits(
-                weights,
-                &workspace.hidden,
-                &mut workspace.normed,
-                logits_buf,
-                cached_out_norm,
-            )?;
         }
-        ctx.advance_position(prompt_tokens.len())?;
+        ctx.advance_position(m)?;
         Ok(())
     }
 

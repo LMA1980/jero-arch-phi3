@@ -1431,4 +1431,149 @@ mod tests {
             Err(K3Error::CapabilityMismatch { .. })
         ));
     }
+
+    #[test]
+    fn test_wave3_batched_prefill_chunked_start_pos_kv_and_logits_parity_miri() {
+        let mut recipe = build_1layer_recipe(4, 8, 2, 1, 6);
+        recipe.original_max_position_embeddings = 2;
+        recipe = recipe
+            .with_rotary_dim(Some(2))
+            .with_rope_scaling(RopeScalingConfig::LongRope {
+                short_factor: vec![1.1],
+                long_factor: vec![2.3],
+                original_max_position_embeddings: 2,
+            })
+            .with_attn_factor(1.15)
+            .with_sliding_window(Some(2));
+
+        let specs = build_full_weight_buffers(4, 8, 4, 2, 6, QuantType::F32, QuantType::F32, true);
+        let weights = weights_from_buffers(&specs);
+        let prompt = [1_u32, 3, 5, 2];
+
+        let mut logits_batch = [0.0_f32; 6];
+        let mut kv_batch = vec![0.0_f32; 6 * 2 * 2];
+        let mut ctx_b =
+            ExecutionContext::new(&prompt, 6, &mut logits_batch, &mut kv_batch).expect("batch ctx");
+        recipe
+            .prefill_step(&mut ctx_b, &weights)
+            .expect("batched prefill");
+
+        // Chunked prefill across LongRoPE boundary (`orig_max=2`) and sliding window (`2`).
+        let mut logits_chunk = [0.0_f32; 6];
+        let mut kv_chunk = vec![0.0_f32; 6 * 2 * 2];
+        let mut empty_logits: [f32; 0] = [];
+        let mut ctx_c0 = ExecutionContext::new_prefill_chunk(
+            &prompt[..2],
+            6,
+            0,
+            false,
+            &mut empty_logits,
+            &mut kv_chunk,
+        )
+        .expect("chunk 0");
+        recipe.prefill_step(&mut ctx_c0, &weights).expect("run c0");
+        assert_eq!(ctx_c0.position(), 2);
+
+        let mut ctx_c1 = ExecutionContext::new_prefill_chunk(
+            &prompt[2..],
+            6,
+            2,
+            true,
+            &mut logits_chunk,
+            &mut kv_chunk,
+        )
+        .expect("chunk 1");
+        recipe.prefill_step(&mut ctx_c1, &weights).expect("run c1");
+        assert_eq!(ctx_c1.position(), 4);
+
+        // Sequential decode equivalence across all 4 positions.
+        let mut logits_seq = [0.0_f32; 6];
+        let mut kv_seq = vec![0.0_f32; 6 * 2 * 2];
+        let mut ctx_s =
+            ExecutionContext::new(&prompt[..1], 6, &mut logits_seq, &mut kv_seq).expect("seq ctx");
+        recipe.prefill_step(&mut ctx_s, &weights).expect("p0");
+        for &tok in &prompt[1..] {
+            ctx_s.prepare_decode(tok).expect("prep");
+            recipe.decode_step(&mut ctx_s, &weights).expect("dec");
+        }
+
+        for (i, (&b, (&c, &s))) in logits_batch
+            .iter()
+            .zip(logits_chunk.iter().zip(&logits_seq))
+            .enumerate()
+        {
+            assert!((b - c).abs() < 1e-4, "logit[{i}] batch {b} != chunk {c}");
+            assert!((b - s).abs() < 1e-4, "logit[{i}] batch {b} != seq {s}");
+        }
+        for (i, (&b, (&c, &s))) in kv_batch
+            .iter()
+            .zip(kv_chunk.iter().zip(&kv_seq))
+            .enumerate()
+        {
+            assert!((b - c).abs() < 1e-4, "kv[{i}] batch {b} != chunk {c}");
+            assert!((b - s).abs() < 1e-4, "kv[{i}] batch {b} != seq {s}");
+        }
+    }
+
+    #[test]
+    fn test_phi3_split_matrix_gemm_shared_act_and_rows_miri() {
+        const COLS: usize = 8;
+        const ROWS: usize = 10; // Crosses REPACK_TILE_ROWS = 8
+        const M: usize = 2;
+
+        let w_f32: Vec<f32> = (0..ROWS * COLS)
+            .map(|i| pattern_f32(i, 3, 1, 13, 6.0, 0.08))
+            .collect();
+        let w_bytes: Vec<u8> = w_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tv = TensorView::from_bytes("w", QuantType::F32, &[COLS, ROWS], 0, &w_bytes)
+            .expect("tensor view");
+        let mat = Phi3SplitMatrix::from_tensor(&tv, ROWS, COLS).expect("split matrix");
+
+        let act: Vec<f32> = (0..M * COLS)
+            .map(|i| pattern_f32(i, 5, 2, 11, 5.0, 0.1))
+            .collect();
+        let mut out_full = vec![0.0_f32; M * ROWS];
+        mat.gemm(&mut out_full, &act, M).expect("full gemm");
+
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut q_act = jero_kernels_rvv::QuantizedActQ8::new();
+            q_act.quantize_into(&act, M, COLS).expect("q_act");
+            let mut out_q = vec![0.0_f32; M * ROWS];
+            mat.gemm_quantized(&mut out_q, &q_act).expect("quant gemm");
+
+            let split = REPACK_TILE_ROWS;
+            let mut top = vec![0.0_f32; M * split];
+            let mut bot = vec![0.0_f32; M * (ROWS - split)];
+            mat.gemm_quantized_rows(&mut top, &q_act, 0..split)
+                .expect("top rows");
+            mat.gemm_quantized_rows(&mut bot, &q_act, split..ROWS)
+                .expect("bot rows");
+
+            for m_idx in 0..M {
+                for r in 0..ROWS {
+                    let full_v = out_full[m_idx * ROWS + r];
+                    let q_v = out_q[m_idx * ROWS + r];
+                    let row_v = if r < split {
+                        top[m_idx * split + r]
+                    } else {
+                        bot[m_idx * (ROWS - split) + (r - split)]
+                    };
+                    assert!((full_v - q_v).abs() < 1e-5);
+                    assert!((q_v - row_v).abs() < 1e-5);
+                }
+            }
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            for m_idx in 0..M {
+                let mut single = vec![0.0_f32; ROWS];
+                mat.gemv(&mut single, &act[m_idx * COLS..(m_idx + 1) * COLS])
+                    .expect("gemv");
+                for r in 0..ROWS {
+                    assert!((out_full[m_idx * ROWS + r] - single[r]).abs() < 1e-5);
+                }
+            }
+        }
+    }
 }

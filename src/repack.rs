@@ -7,10 +7,17 @@
 //! row-contiguous byte slices before calling `jero_kernels_rvv::RepackedWeight::from_tensor` ensures
 //! every logical projection owns dedicated tiles starting cleanly at tile `0`.
 
+#[cfg(feature = "with-kernels")]
+use std::collections::HashMap;
+#[cfg(feature = "with-kernels")]
+use std::ops::Range;
+#[cfg(feature = "with-kernels")]
+use std::sync::{Arc, OnceLock, RwLock};
+
 use jero_core::{ArchRecipe, K3Error, ModelWeights, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight};
+use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight, gemm_repacked, gemm_repacked_rows};
 
 use crate::quant::{decode_1d_norm, quant_row_bytes, resolve_2d_dims};
 #[cfg(not(feature = "with-kernels"))]
@@ -315,6 +322,151 @@ impl Phi3SplitMatrix {
     pub fn gemv_quantized(&self, out: &mut [f32], q_act: &QuantizedActQ8) -> Result<(), K3Error> {
         self.repacked.gemv(out, q_act)
     }
+
+    /// Computes batched multi-token GEMM (`[M, cols] x [rows, cols]^T -> [M, rows]`) from raw
+    /// `f32` activations `input` using `A100` `XSMTVDotII` / `RVV` `RepackedWeight` tiles when
+    /// `with-kernels` is enabled, or portable scalar math under `--no-default-features`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on `m == 0` or buffer dimension mismatches, or
+    /// [`K3Error::CapabilityMismatch`] on unsupported quantization formats.
+    pub fn gemm(&self, out: &mut [f32], input: &[f32], m: usize) -> Result<(), K3Error> {
+        let rows = self.rows();
+        let cols = self.cols();
+        let expected_in = m.checked_mul(cols);
+        let expected_out = m.checked_mul(rows);
+        if m == 0 || expected_in != Some(input.len()) || expected_out != Some(out.len()) {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.name.clone(),
+                offset: 0,
+                byte_len: size_of_val(out),
+                buffer_len: size_of_val(input),
+                reason: format!(
+                    "batched GEMM shape mismatch (m={m}, rows={rows}, cols={cols}, in={}, out={})",
+                    input.len(),
+                    out.len()
+                ),
+            });
+        }
+        #[cfg(feature = "with-kernels")]
+        {
+            let mut q_act = QuantizedActQ8::new();
+            q_act.quantize_into(input, m, cols)?;
+            self.gemm_quantized_parallel(out, &q_act, m)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            let shape = [cols, rows];
+            let view = TensorView::from_bytes(&self.name, self.quant, &shape, 0, &self.data)?;
+            #[cfg(not(miri))]
+            if m >= 2 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+                return out.par_chunks_exact_mut(rows).enumerate().try_for_each(
+                    |(m_idx, out_row)| {
+                        let in_row = &input[m_idx * cols..(m_idx + 1) * cols];
+                        project_matvec(out_row, &view, in_row)
+                    },
+                );
+            }
+            for m_idx in 0..m {
+                let in_row = &input[m_idx * cols..(m_idx + 1) * cols];
+                let out_row = &mut out[m_idx * rows..(m_idx + 1) * rows];
+                project_matvec(out_row, &view, in_row)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Computes full-matrix batched GEMM (`[M, cols] x [rows, cols]^T -> [M, rows]`) reusing an
+    /// already-quantized `[M, cols]` activation batch (`QuantizedActQ8`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemm_quantized(&self, out: &mut [f32], q_act: &QuantizedActQ8) -> Result<(), K3Error> {
+        gemm_repacked(out, &self.repacked, q_act)
+    }
+
+    /// Computes row-sliced batched GEMM (`[M, cols] x [row_range, cols]^T -> [M, row_range.len()]`)
+    /// reusing an already-quantized `[M, cols]` activation batch (`QuantizedActQ8`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `row_range` is out of bounds or dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemm_quantized_rows(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8,
+        row_range: Range<usize>,
+    ) -> Result<(), K3Error> {
+        gemm_repacked_rows(out, &self.repacked, q_act, row_range)
+    }
+
+    /// Dispatches row-sliced `gemm_repacked_rows` across active `WorkerPool` threads on
+    /// `REPACK_TILE_ROWS`-aligned partitions when inside a parallel Rayon pool (`not(miri)`), or
+    /// sequentially otherwise.
+    #[cfg(feature = "with-kernels")]
+    pub(crate) fn gemm_quantized_parallel(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8,
+        m: usize,
+    ) -> Result<(), K3Error> {
+        #[cfg(not(miri))]
+        {
+            let rows = self.rows();
+            let workers = rayon::current_num_threads();
+            if workers > 1 && rows > REPACK_TILE_ROWS && m.saturating_mul(rows) >= 256 {
+                let ranges = partition_tile_row_ranges(rows, workers);
+                if ranges.len() > 1 {
+                    use rayon::prelude::*;
+                    let partials: Vec<(Range<usize>, Vec<f32>)> = ranges
+                        .into_par_iter()
+                        .map(|range| {
+                            let sub_n = range.len();
+                            let mut sub_out = vec![0.0_f32; m * sub_n];
+                            self.gemm_quantized_rows(&mut sub_out, q_act, range.clone())?;
+                            Ok((range, sub_out))
+                        })
+                        .collect::<Result<Vec<_>, K3Error>>()?;
+                    for (range, sub_out) in partials {
+                        let sub_n = range.len();
+                        for m_idx in 0..m {
+                            let dst =
+                                &mut out[m_idx * rows + range.start..m_idx * rows + range.end];
+                            let src = &sub_out[m_idx * sub_n..(m_idx + 1) * sub_n];
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let _ = m;
+        self.gemm_quantized(out, q_act)
+    }
+}
+
+#[cfg(all(feature = "with-kernels", not(miri)))]
+fn partition_tile_row_ranges(total_rows: usize, workers: usize) -> Vec<Range<usize>> {
+    let tiles = total_rows.div_ceil(REPACK_TILE_ROWS);
+    let active_workers = workers.min(tiles).max(1);
+    let base_tiles = tiles / active_workers;
+    let rem_tiles = tiles % active_workers;
+    let mut ranges = Vec::with_capacity(active_workers);
+    let mut start = 0_usize;
+    for w in 0..active_workers {
+        let tile_span = base_tiles + usize::from(w < rem_tiles);
+        let end = (start + tile_span * REPACK_TILE_ROWS).min(total_rows);
+        if start < end {
+            ranges.push(start..end);
+        }
+        start = end;
+        if start >= total_rows {
+            break;
+        }
+    }
+    ranges
 }
 
 /// Pre-split attention and MLP sub-matrices plus cached 1D `RMSNorm` vectors for a single layer.
@@ -374,6 +526,8 @@ impl Phi3LayerRepack {
         let attn_norm_view = weights.tensor(&format!("blk.{layer}.attn_norm.weight"))?;
         let attn_norm = decode_1d_norm(&attn_norm_view, hidden)?;
         let ffn_norm = if let Ok(v) = weights.tensor(&format!("blk.{layer}.ffn_norm.weight")) {
+            decode_1d_norm(&v, hidden)?
+        } else if let Ok(v) = weights.tensor(&format!("blk.{layer}.post_attention_norm.weight")) {
             decode_1d_norm(&v, hidden)?
         } else {
             vec![1.0_f32; hidden]
@@ -669,4 +823,150 @@ fn split_layer_mlp_up(
         hidden,
     )?;
     Ok((wgate, wup))
+}
+
+#[cfg(feature = "with-kernels")]
+const MAX_CACHED_LAYER_REPACKS: usize = 128;
+
+#[cfg(feature = "with-kernels")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LayerRepackKey {
+    architecture: &'static str,
+    layer: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    ffn_dim: usize,
+    digest: u64,
+}
+
+#[cfg(feature = "with-kernels")]
+#[inline]
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *hash ^= u64::from(b);
+        *hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn hash_tensor_view(hash: &mut u64, view: &TensorView<'_>) {
+    fnv1a_update(hash, view.name().as_bytes());
+    fnv1a_update(hash, &[quant_tag(view.quant())]);
+    for &dim in view.shape() {
+        fnv1a_update(hash, &dim.to_le_bytes());
+    }
+    let raw = view.as_bytes();
+    fnv1a_update(hash, &raw.len().to_le_bytes());
+    if raw.len() <= 8192 {
+        fnv1a_update(hash, raw);
+    } else {
+        fnv1a_update(hash, &(raw.as_ptr() as usize).to_le_bytes());
+        let sample = 64_usize.min(raw.len());
+        let step = (raw.len() / 16).max(sample);
+        let mut off = 0_usize;
+        while off + sample <= raw.len() {
+            fnv1a_update(hash, &raw[off..off + sample]);
+            off += step;
+        }
+        fnv1a_update(hash, &raw[raw.len() - sample..]);
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+const fn quant_tag(q: QuantType) -> u8 {
+    match q {
+        QuantType::F32 => 0,
+        QuantType::F16 => 1,
+        QuantType::BF16 => 2,
+        QuantType::Q4_0 => 3,
+        QuantType::Q4_1 => 4,
+        QuantType::Q5_0 => 5,
+        QuantType::Q5_1 => 6,
+        QuantType::Q8_0 => 7,
+        QuantType::Q8_1 => 8,
+        QuantType::Q2_K => 9,
+        QuantType::Q3_K => 10,
+        QuantType::Q4_K_M => 11,
+        QuantType::Q5_K => 12,
+        QuantType::Q6_K => 13,
+        QuantType::IQ4_NL => 14,
+        QuantType::MXFP4 => 15,
+        QuantType::TQ1_0 => 16,
+        QuantType::TQ2_0 => 17,
+        QuantType::I2_S => 18,
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn compute_layer_repack_key(
+    recipe: &Phi3Recipe,
+    layer: usize,
+    weights: &dyn ModelWeights,
+) -> LayerRepackKey {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    if let Ok(embd) = weights.tensor("token_embd.weight") {
+        fnv1a_update(
+            &mut hash,
+            &(embd.as_bytes().as_ptr() as usize).to_le_bytes(),
+        );
+        fnv1a_update(&mut hash, &embd.as_bytes().len().to_le_bytes());
+    }
+    for suffix in [
+        "attn_norm.weight",
+        "ffn_norm.weight",
+        "post_attention_norm.weight",
+        "attn_qkv.weight",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "ffn_up.weight",
+        "ffn_gate.weight",
+        "ffn_down.weight",
+    ] {
+        let name = format!("blk.{layer}.{suffix}");
+        if let Ok(view) = weights.tensor(&name) {
+            hash_tensor_view(&mut hash, &view);
+        }
+    }
+    LayerRepackKey {
+        architecture: recipe.architecture_id(),
+        layer,
+        hidden_dim: recipe.hidden_dim,
+        q_dim: recipe.n_heads_q * recipe.head_dim,
+        kv_dim: recipe.n_heads_kv * recipe.head_dim,
+        ffn_dim: recipe.ffn_dim,
+        digest: hash,
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn global_layer_repack_cache() -> &'static RwLock<HashMap<LayerRepackKey, Arc<Phi3LayerRepack>>> {
+    static CACHE: OnceLock<RwLock<HashMap<LayerRepackKey, Arc<Phi3LayerRepack>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Retrieves an ABA-safe cached [`Phi3LayerRepack`] for `layer` or pre-splits and caches it on
+/// first prefill access.
+#[cfg(feature = "with-kernels")]
+pub(crate) fn get_or_repack_layer(
+    recipe: &Phi3Recipe,
+    layer: usize,
+    weights: &dyn ModelWeights,
+) -> Result<Arc<Phi3LayerRepack>, K3Error> {
+    let key = compute_layer_repack_key(recipe, layer, weights);
+    if let Ok(guard) = global_layer_repack_cache().read()
+        && let Some(cached) = guard.get(&key)
+    {
+        return Ok(Arc::clone(cached));
+    }
+    let built = Arc::new(Phi3LayerRepack::from_weights(recipe, layer, weights)?);
+    if let Ok(mut guard) = global_layer_repack_cache().write() {
+        if guard.len() >= MAX_CACHED_LAYER_REPACKS {
+            guard.clear();
+        }
+        guard.insert(key, Arc::clone(&built));
+    }
+    Ok(built)
 }

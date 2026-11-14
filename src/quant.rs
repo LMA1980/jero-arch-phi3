@@ -8,12 +8,14 @@ use jero_core::{K3Error, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    BaselineKernel, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
+    AttentionMaskConfig, BaselineKernel, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
     Q4_K_M_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
     Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, VectorKernel, bf16_to_f32_finite,
-    dequantize_token_row, f16_to_f32_finite, gqa_causal_attention_f32, swiglu_f32, vec_dot_bf16,
-    vec_dot_f16, vec_dot_q4_0,
+    dequantize_token_row, f16_to_f32_finite, gqa_causal_attention_f32,
+    gqa_causal_attention_prefill_f32, swiglu_f32, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
 };
+#[cfg(all(feature = "with-kernels", not(miri)))]
+use jero_kernels_rvv::{gqa_causal_attention_prefill_kv_heads_f32, gqa_kv_head_partition};
 
 #[cfg(not(feature = "with-kernels"))]
 const Q4_0_BLOCK_ELEMENTS: usize = 32;
@@ -952,5 +954,371 @@ pub(crate) fn gqa_attention_f32(
             }
         }
         Ok(())
+    }
+}
+
+/// Computes batched `RMSNorm` across `m` contiguous rows of width `hidden`.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if dimensions are zero or slice lengths mismatch.
+pub(crate) fn rmsnorm_batch_f32(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    m: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<(), K3Error> {
+    let expected = m.checked_mul(hidden);
+    if m == 0
+        || hidden == 0
+        || expected != Some(input.len())
+        || expected != Some(output.len())
+        || weight.len() != hidden
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "rmsnorm_batch".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(output),
+            buffer_len: size_of_val(input),
+            reason: format!(
+                "rmsnorm_batch mismatch (m={m}, hidden={hidden}, out={}, in={}, w={})",
+                output.len(),
+                input.len(),
+                weight.len()
+            ),
+        });
+    }
+
+    #[cfg(not(miri))]
+    if m >= 2 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        return output
+            .par_chunks_exact_mut(hidden)
+            .enumerate()
+            .try_for_each(|(row_idx, out_row)| {
+                let in_row = &input[row_idx * hidden..(row_idx + 1) * hidden];
+                rmsnorm_f32(out_row, in_row, weight, eps)
+            });
+    }
+
+    for m_idx in 0..m {
+        let start = m_idx * hidden;
+        let end = start + hidden;
+        rmsnorm_f32(&mut output[start..end], &input[start..end], weight, eps)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "with-kernels", not(miri)))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches gqa_causal_attention_prefill_kv_heads_f32 ABI"
+)]
+fn gqa_prefill_causal_parallel(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    sliding_window: Option<usize>,
+    config: AttentionMaskConfig,
+    workers: usize,
+) -> Result<(), K3Error> {
+    use rayon::prelude::*;
+    let scratch_len = sliding_window.map_or(total_seq_len, |w| w.min(total_seq_len));
+    let full_q_width = n_heads_q * head_dim;
+    let partials = (0..workers)
+        .into_par_iter()
+        .filter_map(|worker_idx| gqa_kv_head_partition(n_heads_kv, n_heads_q, worker_idx, workers))
+        .map(|(kv_range, q_range)| {
+            let sub_q_width = q_range.len() * head_dim;
+            let mut sub_out = vec![0.0_f32; m * sub_q_width];
+            let mut local_scratch = vec![0.0_f32; scratch_len.max(1)];
+            gqa_causal_attention_prefill_kv_heads_f32(
+                &mut sub_out,
+                q,
+                k_cache,
+                v_cache,
+                m,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                total_seq_len,
+                kv_range,
+                config,
+                &mut local_scratch,
+            )?;
+            Ok((q_range, sub_out))
+        })
+        .collect::<Result<Vec<_>, K3Error>>()?;
+
+    for (q_range, sub_out) in partials {
+        let sub_q_width = q_range.len() * head_dim;
+        for m_idx in 0..m {
+            let dst_off = m_idx * full_q_width + q_range.start * head_dim;
+            let src_off = m_idx * sub_q_width;
+            out[dst_off..dst_off + sub_q_width]
+                .copy_from_slice(&sub_out[src_off..src_off + sub_q_width]);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scalar GQA validator checks all dimensions explicitly"
+)]
+fn validate_gqa_prefill_scalar(
+    out: &[f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    scores_scratch: &[f32],
+) -> Result<(), K3Error> {
+    if n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0 || m == 0 || total_seq_len == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "phi3".to_owned(),
+            reason: "GQA prefill dimensions must be non-zero".to_owned(),
+        });
+    }
+    if n_heads_q % n_heads_kv != 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "phi3".to_owned(),
+            reason: format!("n_heads_q ({n_heads_q}) not divisible by n_heads_kv ({n_heads_kv})"),
+        });
+    }
+    if !scale.is_finite() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "phi3".to_owned(),
+            reason: format!("attention scale must be finite (got {scale})"),
+        });
+    }
+    if sliding_window == Some(0) {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "phi3".to_owned(),
+            reason: "sliding_window must be >= 1 when set".to_owned(),
+        });
+    }
+    let query_end = start_pos
+        .checked_add(m)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_prefill_start_pos".to_owned(),
+            offset: start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: "start_pos + m overflow".to_owned(),
+        })?;
+    if query_end > total_seq_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_prefill_start_pos".to_owned(),
+            offset: start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: format!("start_pos + m ({query_end}) exceeds total_seq_len ({total_seq_len})"),
+        });
+    }
+    let q_len = m * n_heads_q * head_dim;
+    let kv_width = n_heads_kv * head_dim;
+    let kv_min = total_seq_len * kv_width;
+    let min_scratch = sliding_window.map_or(query_end, |w| w.min(query_end));
+    if q.len() != q_len
+        || out.len() != q_len
+        || k_cache.len() < kv_min
+        || v_cache.len() < kv_min
+        || scores_scratch.len() < min_scratch
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_causal_attention_prefill".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(q),
+            buffer_len: size_of_val(k_cache),
+            reason: "GQA prefill buffer or scratch dimension mismatch".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches gqa_causal_attention_prefill_f32 kernel ABI directly"
+)]
+fn gqa_prefill_causal_scalar(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    validate_gqa_prefill_scalar(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        m,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        total_seq_len,
+        start_pos,
+        sliding_window,
+        scale,
+        scores_scratch,
+    )?;
+
+    let group_size = n_heads_q / n_heads_kv;
+    for m_idx in 0..m {
+        let query_pos = start_pos + m_idx;
+        let valid_end = (query_pos + 1).min(total_seq_len);
+        let valid_start =
+            sliding_window.map_or(0, |w| query_pos.saturating_add(1).saturating_sub(w));
+        let active_len = valid_end.saturating_sub(valid_start);
+        let score_buf = &mut scores_scratch[..active_len];
+
+        for h_q in 0..n_heads_q {
+            let h_kv = h_q / group_size;
+            let q_head = &q[(m_idx * n_heads_q + h_q) * head_dim..][..head_dim];
+            let mut max_score = f32::NEG_INFINITY;
+            for (slot, s) in score_buf.iter_mut().zip(valid_start..valid_end) {
+                let kv_off = (s * n_heads_kv + h_kv) * head_dim;
+                let sc = dot_product_f32(q_head, &k_cache[kv_off..kv_off + head_dim]) * scale;
+                *slot = sc;
+                if sc > max_score {
+                    max_score = sc;
+                }
+            }
+            let mut sum_exp = 0.0_f32;
+            for slot in &mut score_buf[..active_len] {
+                let e = (*slot - max_score).exp();
+                *slot = e;
+                sum_exp += e;
+            }
+            #[expect(clippy::cast_precision_loss, reason = "active_len fits cleanly in f32")]
+            let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
+                1.0_f32 / sum_exp
+            } else {
+                1.0_f32 / (active_len.max(1) as f32)
+            };
+            let out_head = &mut out[(m_idx * n_heads_q + h_q) * head_dim..][..head_dim];
+            out_head.fill(0.0);
+            for (s, &e) in (valid_start..valid_end).zip(&score_buf[..active_len]) {
+                let w = e * inv_sum;
+                let kv_off = (s * n_heads_kv + h_kv) * head_dim;
+                let v_head = &v_cache[kv_off..kv_off + head_dim];
+                for (dst, &v_val) in out_head.iter_mut().zip(v_head) {
+                    *dst += w * v_val;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Computes batched causal GQA prefill over query rows `[start_pos..start_pos + m)` attending
+/// over KV history `[0..total_seq_len)`.
+///
+/// Dispatches across active `WorkerPool` threads partitioned by KV heads (`with-kernels`) or
+/// portable scalar math (`--no-default-features`).
+///
+/// # Errors
+/// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] on invalid
+/// geometry or buffer dimensions.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches gqa_causal_attention_prefill_f32 kernel ABI directly"
+)]
+pub(crate) fn gqa_prefill_causal_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let config =
+            AttentionMaskConfig::causal(start_pos, scale).with_sliding_window(sliding_window);
+        #[cfg(not(miri))]
+        {
+            let workers = rayon::current_num_threads().min(n_heads_kv);
+            if workers > 1 && n_heads_kv >= 2 {
+                return gqa_prefill_causal_parallel(
+                    out,
+                    q,
+                    k_cache,
+                    v_cache,
+                    m,
+                    n_heads_q,
+                    n_heads_kv,
+                    head_dim,
+                    total_seq_len,
+                    sliding_window,
+                    config,
+                    workers,
+                );
+            }
+        }
+
+        gqa_causal_attention_prefill_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            config,
+            scores_scratch,
+        )
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        gqa_prefill_causal_scalar(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            start_pos,
+            sliding_window,
+            scale,
+            scores_scratch,
+        )
     }
 }
