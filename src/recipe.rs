@@ -7,13 +7,95 @@
 
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, TensorView,
+    ModelMetadata, ModelWeights, QuantType, StopCriteria, TensorView,
 };
+#[cfg(feature = "with-kernels")]
+use jero_kernels_rvv::QuantizedActQ8;
 
 use crate::quant::{
     decode_1d_norm, dequantize_row_to_f32, dot_product_f32, gqa_attention_f32, project_matvec,
     resolve_2d_dims, rmsnorm_f32, swiglu_layer_f32,
 };
+use crate::repack::{Phi3LayerRepack, Phi3ModelRepack};
+
+/// Canonical padded vocabulary size for `Phi-3` / `Phi-3.5-mini` models (`32,064`).
+pub const PHI35_PADDED_VOCAB_SIZE: usize = 32_064;
+/// Canonical vocabulary size for `Phi-4-mini` (`o200k`, `200,064`).
+pub const PHI4_MINI_VOCAB_SIZE: usize = 200_064;
+/// Canonical vocabulary size for `Phi-4` (`14B`, `100,352`).
+pub const PHI4_14B_VOCAB_SIZE: usize = 100_352;
+
+/// Chat-template and end-of-turn delimiter dialect used by Phi-3 / Phi-4 GGUF models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhiChatDialect {
+    /// Phi-3 / Phi-3.5 / Phi-4-mini `<|user|>...<|end|>\n<|assistant|>` turn framing (`<|end|>` stop).
+    Phi3End,
+    /// Phi-4 `<|im_start|>role<|im_sep|>content<|im_end|>` turn framing (`<|im_sep|>` / `<|im_end|>` stop).
+    Phi4ImSep,
+}
+
+/// Validated vocabulary bounds, chat dialect, and [`StopCriteria`]-compatible stop token IDs
+/// extracted from Phi-3 / Phi-4 GGUF metadata and tensor descriptors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhiStopMetadata {
+    /// Detected chat framing dialect.
+    pub dialect: PhiChatDialect,
+    /// Validated model vocabulary row count shared across embeddings, LM head, and logits buffers.
+    pub vocab_size: usize,
+    /// Entry count in `tokenizer.ggml.tokens`, when present.
+    pub token_list_len: Option<usize>,
+    /// Beginning-of-sequence token ID (`tokenizer.ggml.bos_token_id`), if present.
+    pub bos_token_id: Option<u32>,
+    /// End-of-sequence token ID (`tokenizer.ggml.eos_token_id`), if present.
+    pub eos_token_id: Option<u32>,
+    /// End-of-turn token ID (`tokenizer.ggml.eot_token_id`), if present.
+    pub eot_token_id: Option<u32>,
+    /// Token ID resolved for `"<|end|>"` in `tokenizer.ggml.tokens`, if present.
+    pub end_token_id: Option<u32>,
+    /// Token ID resolved for `"<|im_sep|>"` in `tokenizer.ggml.tokens`, if present.
+    pub im_sep_token_id: Option<u32>,
+    /// Token ID resolved for `"<|im_end|>"` in `tokenizer.ggml.tokens`, if present.
+    pub im_end_token_id: Option<u32>,
+    /// Token ID resolved for `"<|endoftext|>"` in `tokenizer.ggml.tokens`, if present.
+    pub endoftext_token_id: Option<u32>,
+    /// Deterministic, deduplicated stop token IDs passed directly to [`StopCriteria`].
+    pub stop_token_ids: Vec<u32>,
+    /// `true` when `output.weight` is absent and the LM head ties to `token_embd.weight`.
+    pub has_tied_lm_head: bool,
+}
+
+impl PhiStopMetadata {
+    /// Builds a [`StopCriteria`] referencing [`Self::stop_token_ids`] for sampling termination.
+    #[must_use]
+    pub fn stop_criteria(&self, max_tokens: usize, n_ctx: usize) -> StopCriteria<'_> {
+        StopCriteria::new(&self.stop_token_ids, max_tokens, n_ctx)
+    }
+
+    /// Fails closed with [`K3Error::CapabilityMismatch`] if `logits.len()` diverges from
+    /// [`Self::vocab_size`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] when `logits.len() != self.vocab_size`.
+    pub fn validate_logits_slice(&self, architecture: &str, logits: &[f32]) -> Result<(), K3Error> {
+        if logits.len() != self.vocab_size {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: architecture.to_owned(),
+                reason: format!(
+                    "logits slice len {} diverges from validated GGUF vocab_size {}",
+                    logits.len(),
+                    self.vocab_size
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if `token_id` matches any resolved stop/EOT token ID.
+    #[must_use]
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token_ids.contains(&token_id)
+    }
+}
 
 /// `RoPE` scaling strategies supported by Phi-3 and Phi-4 architectures.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -291,21 +373,8 @@ impl Phi3Recipe {
             .filter(|&f| f > 0)
             .unwrap_or(base.ffn_dim);
 
-        let inferred_vocab = metadata.find_tensor("token_embd.weight").and_then(|t| {
-            let s = t.shape();
-            if s.len() == 2 && s[0] == hidden_dim && s[1] > 0 {
-                Some(s[1])
-            } else if s.len() == 2 && s[1] == hidden_dim && s[0] > 0 {
-                Some(s[0])
-            } else {
-                None
-            }
-        });
-        let vocab_size = metadata
-            .vocab_size()
-            .filter(|&v| v > 0)
-            .or(inferred_vocab)
-            .unwrap_or(base.vocab_size);
+        let vocab_size =
+            resolve_vocab_size_from_metadata(metadata, hidden_dim, base.vocab_size, arch)?;
 
         let original_max_position_embeddings = if metadata.context_length() > 0 {
             metadata.context_length()
@@ -418,6 +487,7 @@ impl Phi3Recipe {
             recipe.rope_scaling = RopeScalingConfig::Linear { factor };
         }
 
+        recipe.validate_gguf_contracts(gguf)?;
         Ok(recipe)
     }
 
@@ -555,11 +625,18 @@ impl Phi3Recipe {
         weights: &dyn ModelWeights,
         kv_view: &mut KvCacheView<'_>,
         workspace: &mut ForwardWorkspace,
+        repack_cache: Option<&Phi3ModelRepack>,
     ) -> Result<(), K3Error> {
         let synthetic_mode = weights.tensor_count() == 0;
         let hidden = self.hidden_dim;
 
         if synthetic_mode {
+            if repack_cache.is_some() {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: self.architecture.to_owned(),
+                    reason: "repack cache cannot be used with empty synthetic weights".to_owned(),
+                });
+            }
             synthesize_embedding(token_id, &mut workspace.hidden);
         } else {
             let embd_view = weights.tensor("token_embd.weight")?;
@@ -570,7 +647,15 @@ impl Phi3Recipe {
             if synthetic_mode {
                 self.forward_synthetic_layer(layer, abs_pos, kv_view, workspace)?;
             } else {
-                self.forward_authentic_layer(layer, abs_pos, weights, kv_view, workspace)?;
+                let layer_repack = repack_cache.and_then(|cache| cache.layer(layer));
+                self.forward_authentic_layer(
+                    layer,
+                    abs_pos,
+                    weights,
+                    layer_repack,
+                    kv_view,
+                    workspace,
+                )?;
             }
         }
 
@@ -647,37 +732,15 @@ impl Phi3Recipe {
         layer: usize,
         abs_pos: usize,
         weights: &dyn ModelWeights,
+        layer_repack: Option<&Phi3LayerRepack>,
         kv_view: &mut KvCacheView<'_>,
         workspace: &mut ForwardWorkspace,
     ) -> Result<(), K3Error> {
-        let hidden = self.hidden_dim;
-        let total_q = self.n_heads_q * self.head_dim;
         let total_kv = self.n_heads_kv * self.head_dim;
         #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
         let attn_scale = 1.0_f32 / (self.head_dim as f32).sqrt();
 
-        let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
-        let norm_view = weights.tensor(&attn_norm_name)?;
-        let norm_w = decode_1d_norm(&norm_view, hidden)?;
-        rmsnorm_f32(
-            &mut workspace.normed,
-            &workspace.hidden,
-            &norm_w,
-            self.rms_eps,
-        )?;
-
-        project_layer_qkv(
-            layer,
-            hidden,
-            total_q,
-            total_kv,
-            weights,
-            &workspace.normed,
-            &mut workspace.q,
-            &mut workspace.k,
-            &mut workspace.v,
-        )?;
-
+        self.project_layer_attn_qkv_into_ws(layer, weights, layer_repack, workspace)?;
         self.apply_rope_and_attn_factor(&mut workspace.q, self.n_heads_q, abs_pos);
         self.apply_rope_and_attn_factor(&mut workspace.k, self.n_heads_kv, abs_pos);
 
@@ -701,46 +764,114 @@ impl Phi3Recipe {
             attn_scale,
         )?;
 
-        let o_name = format!("blk.{layer}.attn_output.weight");
-        let o_view = weights.tensor(&o_name)?;
-        project_matvec(&mut workspace.proj_hidden, &o_view, &workspace.attn_out)?;
-        for (h, &delta) in workspace
-            .hidden
-            .iter_mut()
-            .zip(workspace.proj_hidden.iter())
-        {
-            *h += delta;
+        Self::project_layer_attn_output_and_add(layer, weights, layer_repack, workspace)?;
+        self.project_layer_mlp_and_add(layer, weights, layer_repack, workspace)
+    }
+
+    fn project_layer_attn_qkv_into_ws(
+        &self,
+        layer: usize,
+        weights: &dyn ModelWeights,
+        layer_repack: Option<&Phi3LayerRepack>,
+        workspace: &mut ForwardWorkspace,
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        let total_q = self.n_heads_q * self.head_dim;
+        let total_kv = self.n_heads_kv * self.head_dim;
+        if let Some(lr) = layer_repack {
+            rmsnorm_f32(
+                &mut workspace.normed,
+                &workspace.hidden,
+                lr.attn_norm(),
+                self.rms_eps,
+            )?;
+            project_repacked_qkv(lr, workspace)
+        } else {
+            let attn_norm_name = format!("blk.{layer}.attn_norm.weight");
+            let norm_view = weights.tensor(&attn_norm_name)?;
+            let norm_w = decode_1d_norm(&norm_view, hidden)?;
+            rmsnorm_f32(
+                &mut workspace.normed,
+                &workspace.hidden,
+                &norm_w,
+                self.rms_eps,
+            )?;
+            project_layer_qkv(
+                layer,
+                hidden,
+                total_q,
+                total_kv,
+                weights,
+                &workspace.normed,
+                &mut workspace.q,
+                &mut workspace.k,
+                &mut workspace.v,
+            )
         }
+    }
 
-        let ffn_norm_w = load_ffn_norm(layer, hidden, weights)?;
-        rmsnorm_f32(
-            &mut workspace.normed,
-            &workspace.hidden,
-            &ffn_norm_w,
-            self.rms_eps,
-        )?;
+    fn project_layer_attn_output_and_add(
+        layer: usize,
+        weights: &dyn ModelWeights,
+        layer_repack: Option<&Phi3LayerRepack>,
+        workspace: &mut ForwardWorkspace,
+    ) -> Result<(), K3Error> {
+        if let Some(lr) = layer_repack {
+            lr.wo()
+                .gemv(&mut workspace.proj_hidden, &workspace.attn_out)?;
+        } else {
+            let o_name = format!("blk.{layer}.attn_output.weight");
+            let o_view = weights.tensor(&o_name)?;
+            project_matvec(&mut workspace.proj_hidden, &o_view, &workspace.attn_out)?;
+        }
+        add_residual_in_place(&mut workspace.hidden, &workspace.proj_hidden);
+        Ok(())
+    }
 
-        project_layer_mlp_up(
-            layer,
-            hidden,
-            self.ffn_dim,
-            weights,
-            &workspace.normed,
-            &mut workspace.gate,
-            &mut workspace.up,
-        )?;
+    fn project_layer_mlp_and_add(
+        &self,
+        layer: usize,
+        weights: &dyn ModelWeights,
+        layer_repack: Option<&Phi3LayerRepack>,
+        workspace: &mut ForwardWorkspace,
+    ) -> Result<(), K3Error> {
+        let hidden = self.hidden_dim;
+        if let Some(lr) = layer_repack {
+            rmsnorm_f32(
+                &mut workspace.normed,
+                &workspace.hidden,
+                lr.ffn_norm(),
+                self.rms_eps,
+            )?;
+            project_repacked_mlp_up(lr, workspace)?;
+        } else {
+            let ffn_norm_w = load_ffn_norm(layer, hidden, weights)?;
+            rmsnorm_f32(
+                &mut workspace.normed,
+                &workspace.hidden,
+                &ffn_norm_w,
+                self.rms_eps,
+            )?;
+            project_layer_mlp_up(
+                layer,
+                hidden,
+                self.ffn_dim,
+                weights,
+                &workspace.normed,
+                &mut workspace.gate,
+                &mut workspace.up,
+            )?;
+        }
         swiglu_layer_f32(&mut workspace.ffn_act, &workspace.gate, &workspace.up)?;
-
-        let down_name = format!("blk.{layer}.ffn_down.weight");
-        let down_view = weights.tensor(&down_name)?;
-        project_matvec(&mut workspace.proj_hidden, &down_view, &workspace.ffn_act)?;
-        for (h, &delta) in workspace
-            .hidden
-            .iter_mut()
-            .zip(workspace.proj_hidden.iter())
-        {
-            *h += delta;
+        if let Some(lr) = layer_repack {
+            lr.wdown()
+                .gemv(&mut workspace.proj_hidden, &workspace.ffn_act)?;
+        } else {
+            let down_name = format!("blk.{layer}.ffn_down.weight");
+            let down_view = weights.tensor(&down_name)?;
+            project_matvec(&mut workspace.proj_hidden, &down_view, &workspace.ffn_act)?;
         }
+        add_residual_in_place(&mut workspace.hidden, &workspace.proj_hidden);
         Ok(())
     }
 
@@ -750,16 +881,14 @@ impl Phi3Recipe {
         hidden_state: &[f32],
         normed_out: &mut [f32],
         logits_out: &mut [f32],
+        cached_output_norm: Option<&[f32]>,
     ) -> Result<(), K3Error> {
         let hidden = self.hidden_dim;
-        if logits_out.len() < self.vocab_size {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "output.weight".to_owned(),
-                offset: 0,
-                byte_len: self.vocab_size * size_of::<f32>(),
-                buffer_len: size_of_val(logits_out),
+        if logits_out.len() != self.vocab_size {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
                 reason: format!(
-                    "logits buffer len {} smaller than vocab_size {}",
+                    "logits buffer len {} diverges from model vocab_size {}",
                     logits_out.len(),
                     self.vocab_size
                 ),
@@ -779,9 +908,13 @@ impl Phi3Recipe {
             return Ok(());
         }
 
-        let out_norm_view = weights.tensor("output_norm.weight")?;
-        let out_norm_w = decode_1d_norm(&out_norm_view, hidden)?;
-        rmsnorm_f32(normed_out, hidden_state, &out_norm_w, self.rms_eps)?;
+        if let Some(norm_w) = cached_output_norm {
+            rmsnorm_f32(normed_out, hidden_state, norm_w, self.rms_eps)?;
+        } else {
+            let out_norm_view = weights.tensor("output_norm.weight")?;
+            let out_norm_w = decode_1d_norm(&out_norm_view, hidden)?;
+            rmsnorm_f32(normed_out, hidden_state, &out_norm_w, self.rms_eps)?;
+        }
 
         let lm_head_view = match weights.tensor("output.weight") {
             Ok(view) => view,
@@ -790,22 +923,17 @@ impl Phi3Recipe {
         };
         let (lm_vocab, _) = resolve_2d_dims(&lm_head_view, hidden)?;
         if lm_vocab != self.vocab_size {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: lm_head_view.name().to_owned(),
-                offset: lm_head_view.offset(),
-                byte_len: lm_head_view.byte_len(),
-                buffer_len: lm_head_view.as_bytes().len(),
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
                 reason: format!(
-                    "LM head row count {lm_vocab} does not match recipe vocab_size {}",
+                    "LM head '{}' row count {lm_vocab} diverges from model vocab_size {}",
+                    lm_head_view.name(),
                     self.vocab_size
                 ),
             });
         }
 
-        if logits_out.len() > lm_vocab {
-            logits_out[lm_vocab..].fill(0.0);
-        }
-        project_matvec(&mut logits_out[..lm_vocab], &lm_head_view, normed_out)
+        project_matvec(logits_out, &lm_head_view, normed_out)
     }
 
     fn resolve_kv_geometry(&self, ctx: &ExecutionContext<'_>) -> Result<KvGeometry, K3Error> {
@@ -851,6 +979,8 @@ struct ForwardWorkspace {
     gate: Vec<f32>,
     up: Vec<f32>,
     ffn_act: Vec<f32>,
+    #[cfg(feature = "with-kernels")]
+    q_act: QuantizedActQ8,
 }
 
 impl ForwardWorkspace {
@@ -869,7 +999,631 @@ impl ForwardWorkspace {
             gate: vec![0.0_f32; recipe.ffn_dim],
             up: vec![0.0_f32; recipe.ffn_dim],
             ffn_act: vec![0.0_f32; recipe.ffn_dim],
+            #[cfg(feature = "with-kernels")]
+            q_act: QuantizedActQ8::new(),
         }
+    }
+}
+
+fn project_repacked_qkv(
+    lr: &Phi3LayerRepack,
+    workspace: &mut ForwardWorkspace,
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        workspace
+            .q_act
+            .quantize_into(&workspace.normed, 1, workspace.normed.len())?;
+        lr.wq().gemv_quantized(&mut workspace.q, &workspace.q_act)?;
+        lr.wk().gemv_quantized(&mut workspace.k, &workspace.q_act)?;
+        lr.wv().gemv_quantized(&mut workspace.v, &workspace.q_act)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        lr.wq().gemv(&mut workspace.q, &workspace.normed)?;
+        lr.wk().gemv(&mut workspace.k, &workspace.normed)?;
+        lr.wv().gemv(&mut workspace.v, &workspace.normed)
+    }
+}
+
+fn project_repacked_mlp_up(
+    lr: &Phi3LayerRepack,
+    workspace: &mut ForwardWorkspace,
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        workspace
+            .q_act
+            .quantize_into(&workspace.normed, 1, workspace.normed.len())?;
+        lr.wgate()
+            .gemv_quantized(&mut workspace.gate, &workspace.q_act)?;
+        lr.wup().gemv_quantized(&mut workspace.up, &workspace.q_act)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        lr.wgate().gemv(&mut workspace.gate, &workspace.normed)?;
+        lr.wup().gemv(&mut workspace.up, &workspace.normed)
+    }
+}
+
+fn add_residual_in_place(hidden: &mut [f32], delta: &[f32]) {
+    for (h, &d) in hidden.iter_mut().zip(delta) {
+        *h += d;
+    }
+}
+
+fn resolve_vocab_size_from_metadata(
+    metadata: &ModelMetadata,
+    hidden_dim: usize,
+    default_vocab: usize,
+    arch: &str,
+) -> Result<usize, K3Error> {
+    let embd_vocab = infer_tensor_vocab_rows(metadata, "token_embd.weight", hidden_dim, arch)?;
+    let out_vocab = infer_tensor_vocab_rows(metadata, "output.weight", hidden_dim, arch)?;
+    if let (Some(ev), Some(ov)) = (embd_vocab, out_vocab)
+        && ev != ov
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "token_embd.weight row count ({ev}) diverges from output.weight row count ({ov})"
+            ),
+        });
+    }
+    let tensor_vocab = out_vocab.or(embd_vocab);
+    match metadata.vocab_size() {
+        Some(0) => Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: "GGUF metadata vocab_size must be positive".to_owned(),
+        }),
+        Some(meta_vocab) => {
+            if let Some(tv) = tensor_vocab
+                && tv != meta_vocab
+            {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!(
+                        "GGUF vocab_size ({meta_vocab}) diverges from model weight row count ({tv})"
+                    ),
+                });
+            }
+            Ok(meta_vocab)
+        }
+        None => Ok(tensor_vocab.unwrap_or(default_vocab)),
+    }
+}
+
+fn infer_tensor_vocab_rows(
+    metadata: &ModelMetadata,
+    tensor_name: &str,
+    hidden_dim: usize,
+    arch: &str,
+) -> Result<Option<usize>, K3Error> {
+    let Some(t) = metadata.find_tensor(tensor_name) else {
+        return Ok(None);
+    };
+    let s = t.shape();
+    if s.len() == 2 && s[0] == hidden_dim && s[1] > 0 {
+        Ok(Some(s[1]))
+    } else if s.len() == 2 && s[1] == hidden_dim && s[0] > 0 {
+        Ok(Some(s[0]))
+    } else {
+        Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "{tensor_name} shape {s:?} does not align with hidden_dim {hidden_dim}"
+            ),
+        })
+    }
+}
+
+fn gguf_optional_token_id(
+    gguf: &GgufFile<'_>,
+    key: &str,
+    vocab_size: usize,
+    arch: &str,
+) -> Result<Option<u32>, K3Error> {
+    let Some(val) = gguf.metadata_value(key) else {
+        return Ok(None);
+    };
+    let id = val.as_u32().ok_or_else(|| K3Error::CapabilityMismatch {
+        architecture: arch.to_owned(),
+        reason: format!("{key} must be an unsigned integer token ID"),
+    })?;
+    if usize::try_from(id).is_ok_and(|idx| idx < vocab_size) {
+        Ok(Some(id))
+    } else {
+        Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("{key} ({id}) out of bounds for vocab_size {vocab_size}"),
+        })
+    }
+}
+
+#[derive(Default)]
+struct ScannedPhiTokens {
+    token_list_len: Option<usize>,
+    end_token_id: Option<u32>,
+    im_sep_token_id: Option<u32>,
+    im_end_token_id: Option<u32>,
+    endoftext_token_id: Option<u32>,
+}
+
+fn scan_phi_special_tokens(
+    gguf: &GgufFile<'_>,
+    vocab_size: usize,
+    arch: &str,
+) -> Result<ScannedPhiTokens, K3Error> {
+    let Some(tok_val) = gguf.metadata_value("tokenizer.ggml.tokens") else {
+        return Ok(ScannedPhiTokens::default());
+    };
+    let Some(GgufArray::String(tokens)) = tok_val.as_array() else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: "tokenizer.ggml.tokens must be a GGUF string array".to_owned(),
+        });
+    };
+    if tokens.len() > vocab_size {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "tokenizer.ggml.tokens length ({}) exceeds vocab_size ({vocab_size})",
+                tokens.len()
+            ),
+        });
+    }
+    let mut out = ScannedPhiTokens {
+        token_list_len: Some(tokens.len()),
+        ..ScannedPhiTokens::default()
+    };
+    for (idx, tok) in tokens.iter().enumerate() {
+        if let Ok(id) = u32::try_from(idx) {
+            match *tok {
+                "<|end|>" => out.end_token_id = Some(id),
+                "<|im_sep|>" => out.im_sep_token_id = Some(id),
+                "<|im_end|>" => out.im_end_token_id = Some(id),
+                "<|endoftext|>" => out.endoftext_token_id = Some(id),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn detect_phi_chat_dialect(
+    arch: &str,
+    im_sep_token_id: Option<u32>,
+    end_token_id: Option<u32>,
+    im_end_token_id: Option<u32>,
+    chat_template: Option<&str>,
+) -> PhiChatDialect {
+    if im_sep_token_id.is_some()
+        || chat_template.is_some_and(|t| t.contains("<|im_sep|>"))
+        || (arch == "phi4" && end_token_id.is_none() && im_end_token_id.is_some())
+    {
+        PhiChatDialect::Phi4ImSep
+    } else {
+        PhiChatDialect::Phi3End
+    }
+}
+
+fn collect_stop_token_ids(
+    dialect: PhiChatDialect,
+    eos_token_id: Option<u32>,
+    end_turn_id: Option<u32>,
+    scanned: &ScannedPhiTokens,
+) -> Vec<u32> {
+    let mut stop_token_ids = Vec::new();
+    match dialect {
+        PhiChatDialect::Phi3End => {
+            push_unique_stop_id(&mut stop_token_ids, scanned.end_token_id);
+            push_unique_stop_id(&mut stop_token_ids, eos_token_id);
+            push_unique_stop_id(&mut stop_token_ids, end_turn_id);
+            push_unique_stop_id(&mut stop_token_ids, scanned.endoftext_token_id);
+            push_unique_stop_id(&mut stop_token_ids, scanned.im_end_token_id);
+        }
+        PhiChatDialect::Phi4ImSep => {
+            push_unique_stop_id(&mut stop_token_ids, scanned.im_end_token_id);
+            push_unique_stop_id(&mut stop_token_ids, scanned.im_sep_token_id);
+            push_unique_stop_id(&mut stop_token_ids, eos_token_id);
+            push_unique_stop_id(&mut stop_token_ids, end_turn_id);
+            push_unique_stop_id(&mut stop_token_ids, scanned.endoftext_token_id);
+            push_unique_stop_id(&mut stop_token_ids, scanned.end_token_id);
+        }
+    }
+    stop_token_ids
+}
+
+fn push_unique_stop_id(dst: &mut Vec<u32>, id: Option<u32>) {
+    if let Some(tok) = id
+        && !dst.contains(&tok)
+    {
+        dst.push(tok);
+    }
+}
+
+impl Phi3Recipe {
+    /// Validates runtime geometry and weight tensor shapes/quantizations against `self`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] if geometry,
+    /// vocab bounds, or tensor formats fail validation.
+    pub(crate) fn validate_weights(&self, weights: &dyn ModelWeights) -> Result<(), K3Error> {
+        self.validate_runtime_geometry()?;
+        if weights.tensor_count() > 0 {
+            let embd_view = weights.tensor("token_embd.weight")?;
+            if !self.supports_quant(embd_view.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(
+                    self.architecture,
+                    embd_view.name(),
+                    embd_view.quant(),
+                ));
+            }
+            let (embd_rows, _) = resolve_2d_dims(&embd_view, self.hidden_dim)?;
+            if embd_rows != self.vocab_size {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: self.architecture.to_owned(),
+                    reason: format!(
+                        "token_embd.weight row count ({embd_rows}) diverges from model vocab_size ({})",
+                        self.vocab_size
+                    ),
+                });
+            }
+
+            let out_norm_view = weights.tensor("output_norm.weight")?;
+            if !self.supports_quant(out_norm_view.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(
+                    self.architecture,
+                    out_norm_view.name(),
+                    out_norm_view.quant(),
+                ));
+            }
+            if out_norm_view.num_elements() != self.hidden_dim {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: out_norm_view.name().to_owned(),
+                    offset: out_norm_view.offset(),
+                    byte_len: out_norm_view.byte_len(),
+                    buffer_len: out_norm_view.as_bytes().len(),
+                    reason: format!(
+                        "output_norm.weight len {} != hidden_dim {}",
+                        out_norm_view.num_elements(),
+                        self.hidden_dim
+                    ),
+                });
+            }
+
+            if let Ok(out_view) = weights.tensor("output.weight") {
+                if !self.supports_quant(out_view.quant()) {
+                    return Err(K3Error::unsupported_tensor_quant(
+                        self.architecture,
+                        out_view.name(),
+                        out_view.quant(),
+                    ));
+                }
+                let (out_rows, _) = resolve_2d_dims(&out_view, self.hidden_dim)?;
+                if out_rows != self.vocab_size {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: self.architecture.to_owned(),
+                        reason: format!(
+                            "output.weight row count ({out_rows}) diverges from model vocab_size ({})",
+                            self.vocab_size
+                        ),
+                    });
+                }
+            }
+            for layer in 0..self.num_layers {
+                for suffix in [
+                    "attn_norm.weight",
+                    "attn_output.weight",
+                    "ffn_up.weight",
+                    "ffn_down.weight",
+                ] {
+                    let name = format!("blk.{layer}.{suffix}");
+                    let view = weights.tensor(&name)?;
+                    if !self.supports_quant(view.quant()) {
+                        return Err(K3Error::unsupported_tensor_quant(
+                            self.architecture,
+                            view.name(),
+                            view.quant(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pre-splits all fused `attn_qkv.weight` and `ffn_up.weight` tensors into independent
+    /// `128-byte`-aligned sub-matrices and caches decoded 1D norm vectors once at model setup.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] if model validation
+    /// or tensor slicing fails.
+    pub fn build_repack_cache(
+        &self,
+        weights: &dyn ModelWeights,
+    ) -> Result<Phi3ModelRepack, K3Error> {
+        Phi3ModelRepack::from_weights(self, weights)
+    }
+
+    /// Validates vocabulary bounds, tied/untied LM-head alignment, special-token bounds, and
+    /// chat-dialect stop tokens (`Phi-3`/`Phi-3.5` `<|end|>` vs `Phi-4` `<|im_sep|>`) from `gguf`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if GGUF `vocab_size`, `tokenizer.ggml.tokens`,
+    /// special token IDs, `token_embd.weight`, or `output.weight` shapes diverge.
+    pub fn extract_stop_metadata(&self, gguf: &GgufFile<'_>) -> Result<PhiStopMetadata, K3Error> {
+        let has_tied_lm_head = self.validate_gguf_vocab_alignment(gguf.metadata())?;
+        let bos_token_id = gguf_optional_token_id(
+            gguf,
+            "tokenizer.ggml.bos_token_id",
+            self.vocab_size,
+            self.architecture,
+        )?;
+        let eos_token_id = gguf_optional_token_id(
+            gguf,
+            "tokenizer.ggml.eos_token_id",
+            self.vocab_size,
+            self.architecture,
+        )?;
+        let end_turn_id = gguf_optional_token_id(
+            gguf,
+            "tokenizer.ggml.eot_token_id",
+            self.vocab_size,
+            self.architecture,
+        )?;
+        let _ = gguf_optional_token_id(
+            gguf,
+            "tokenizer.ggml.padding_token_id",
+            self.vocab_size,
+            self.architecture,
+        )?;
+
+        let scanned = scan_phi_special_tokens(gguf, self.vocab_size, self.architecture)?;
+        let chat_template = gguf
+            .metadata_value("tokenizer.chat_template")
+            .and_then(GgufValue::as_str);
+        let dialect = detect_phi_chat_dialect(
+            self.architecture,
+            scanned.im_sep_token_id,
+            scanned.end_token_id,
+            scanned.im_end_token_id,
+            chat_template,
+        );
+        let stop_token_ids = collect_stop_token_ids(dialect, eos_token_id, end_turn_id, &scanned);
+
+        Ok(PhiStopMetadata {
+            dialect,
+            vocab_size: self.vocab_size,
+            token_list_len: scanned.token_list_len,
+            bos_token_id,
+            eos_token_id,
+            eot_token_id: end_turn_id,
+            end_token_id: scanned.end_token_id,
+            im_sep_token_id: scanned.im_sep_token_id,
+            im_end_token_id: scanned.im_end_token_id,
+            endoftext_token_id: scanned.endoftext_token_id,
+            stop_token_ids,
+            has_tied_lm_head,
+        })
+    }
+
+    fn validate_gguf_vocab_alignment(&self, meta: &ModelMetadata) -> Result<bool, K3Error> {
+        if let Some(meta_vocab) = meta.vocab_size()
+            && meta_vocab != self.vocab_size
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: format!(
+                    "GGUF vocab_size ({meta_vocab}) diverges from recipe vocab_size ({})",
+                    self.vocab_size
+                ),
+            });
+        }
+
+        let embd_vocab = infer_tensor_vocab_rows(
+            meta,
+            "token_embd.weight",
+            self.hidden_dim,
+            self.architecture,
+        )?;
+        if let Some(ev) = embd_vocab
+            && ev != self.vocab_size
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: format!(
+                    "token_embd.weight row count ({ev}) diverges from vocab_size ({})",
+                    self.vocab_size
+                ),
+            });
+        }
+
+        let out_vocab =
+            infer_tensor_vocab_rows(meta, "output.weight", self.hidden_dim, self.architecture)?;
+        if let Some(ov) = out_vocab
+            && ov != self.vocab_size
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: format!(
+                    "output.weight row count ({ov}) diverges from vocab_size ({})",
+                    self.vocab_size
+                ),
+            });
+        }
+
+        Ok(out_vocab.is_none())
+    }
+
+    fn validate_gguf_contracts(&self, gguf: &GgufFile<'_>) -> Result<(), K3Error> {
+        let _ = self.extract_stop_metadata(gguf)?;
+        Ok(())
+    }
+
+    fn validate_repack_cache(&self, cache: &Phi3ModelRepack) -> Result<(), K3Error> {
+        if cache.architecture() != self.architecture
+            || cache.hidden_dim() != self.hidden_dim
+            || cache.vocab_size() != self.vocab_size
+            || cache.layers().len() != self.num_layers
+            || cache.output_norm().len() != self.hidden_dim
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: format!(
+                    "Phi3ModelRepack cache mismatch (cache: arch={}, hidden={}, vocab={}, layers={}; recipe: arch={}, hidden={}, vocab={}, layers={})",
+                    cache.architecture(),
+                    cache.hidden_dim(),
+                    cache.vocab_size(),
+                    cache.layers().len(),
+                    self.architecture,
+                    self.hidden_dim,
+                    self.vocab_size,
+                    self.num_layers
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Executes a prefill step across `ctx.prompt_tokens()` using pre-split `RepackedWeight`
+    /// sub-matrices and cached 1D norm vectors from `cache`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`], [`K3Error::ContextLengthExceeded`], or
+    /// [`K3Error::TensorBoundsError`] on invalid cache, context, or buffer dimensions.
+    pub fn prefill_step_with_repack(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &Phi3ModelRepack,
+    ) -> Result<(), K3Error> {
+        self.validate_repack_cache(cache)?;
+        self.prefill_step_inner(ctx, weights, Some(cache))
+    }
+
+    /// Executes a single-token decode step using pre-split `RepackedWeight` sub-matrices and
+    /// cached 1D norm vectors from `cache`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`], [`K3Error::ContextLengthExceeded`], or
+    /// [`K3Error::TensorBoundsError`] on invalid cache, context, or buffer dimensions.
+    pub fn decode_step_with_repack(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &Phi3ModelRepack,
+    ) -> Result<(), K3Error> {
+        self.validate_repack_cache(cache)?;
+        self.decode_step_inner(ctx, weights, Some(cache))
+    }
+
+    fn prefill_step_inner(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        repack_cache: Option<&Phi3ModelRepack>,
+    ) -> Result<(), K3Error> {
+        self.validate_runtime_geometry()?;
+        if ctx.prompt_tokens().is_empty() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: "prefill_step requires at least one prompt token".to_owned(),
+            });
+        }
+
+        let prompt_tokens: Vec<u32> = ctx.prompt_tokens().to_vec();
+        let start_pos = ctx.position();
+        let end_pos =
+            start_pos
+                .checked_add(prompt_tokens.len())
+                .ok_or(K3Error::ContextLengthExceeded {
+                    requested_tokens: usize::MAX,
+                    max_context_tokens: ctx.n_ctx(),
+                })?;
+        if end_pos > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+
+        let geom = self.resolve_kv_geometry(ctx)?;
+        let cached_out_norm = repack_cache.map(Phi3ModelRepack::output_norm);
+        let mut workspace = ForwardWorkspace::new(self);
+        {
+            let (logits_buf, kv_buf) = ctx.buffers_mut();
+            let mut kv_view = KvCacheView::new(kv_buf, geom)?;
+
+            for (offset, &token_id) in prompt_tokens.iter().enumerate() {
+                self.forward_token(
+                    token_id,
+                    start_pos + offset,
+                    weights,
+                    &mut kv_view,
+                    &mut workspace,
+                    repack_cache,
+                )?;
+            }
+
+            self.write_lm_logits(
+                weights,
+                &workspace.hidden,
+                &mut workspace.normed,
+                logits_buf,
+                cached_out_norm,
+            )?;
+        }
+        ctx.advance_position(prompt_tokens.len())?;
+        Ok(())
+    }
+
+    fn decode_step_inner(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        repack_cache: Option<&Phi3ModelRepack>,
+    ) -> Result<(), K3Error> {
+        self.validate_runtime_geometry()?;
+        let token_id = ctx
+            .decode_token()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: self.architecture.to_owned(),
+                reason: "decode_step requires a decode_token in ExecutionContext".to_owned(),
+            })?;
+        let abs_pos = ctx.position();
+        if abs_pos >= ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: abs_pos.saturating_add(1),
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+
+        let geom = self.resolve_kv_geometry(ctx)?;
+        let cached_out_norm = repack_cache.map(Phi3ModelRepack::output_norm);
+        let mut workspace = ForwardWorkspace::new(self);
+        {
+            let (logits_buf, kv_buf) = ctx.buffers_mut();
+            let mut kv_view = KvCacheView::new(kv_buf, geom)?;
+
+            self.forward_token(
+                token_id,
+                abs_pos,
+                weights,
+                &mut kv_view,
+                &mut workspace,
+                repack_cache,
+            )?;
+            self.write_lm_logits(
+                weights,
+                &workspace.hidden,
+                &mut workspace.normed,
+                logits_buf,
+                cached_out_norm,
+            )?;
+        }
+        ctx.advance_position(1)?;
+        Ok(())
     }
 }
 
@@ -1216,45 +1970,7 @@ impl ArchRecipe for Phi3Recipe {
             }
         }
 
-        if weights.tensor_count() > 0 {
-            for required in ["token_embd.weight", "output_norm.weight"] {
-                let view = weights.tensor(required)?;
-                if !self.supports_quant(view.quant()) {
-                    return Err(K3Error::unsupported_tensor_quant(
-                        self.architecture,
-                        view.name(),
-                        view.quant(),
-                    ));
-                }
-            }
-            if let Ok(out_view) = weights.tensor("output.weight")
-                && !self.supports_quant(out_view.quant())
-            {
-                return Err(K3Error::unsupported_tensor_quant(
-                    self.architecture,
-                    out_view.name(),
-                    out_view.quant(),
-                ));
-            }
-            for layer in 0..self.num_layers {
-                for suffix in [
-                    "attn_norm.weight",
-                    "attn_output.weight",
-                    "ffn_up.weight",
-                    "ffn_down.weight",
-                ] {
-                    let name = format!("blk.{layer}.{suffix}");
-                    let view = weights.tensor(&name)?;
-                    if !self.supports_quant(view.quant()) {
-                        return Err(K3Error::unsupported_tensor_quant(
-                            self.architecture,
-                            view.name(),
-                            view.quant(),
-                        ));
-                    }
-                }
-            }
-        }
+        self.validate_weights(weights)?;
 
         Ok(())
     }
@@ -1264,55 +1980,7 @@ impl ArchRecipe for Phi3Recipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        self.validate_runtime_geometry()?;
-        if ctx.prompt_tokens().is_empty() {
-            return Err(K3Error::CapabilityMismatch {
-                architecture: self.architecture.to_owned(),
-                reason: "prefill_step requires at least one prompt token".to_owned(),
-            });
-        }
-
-        let prompt_tokens: Vec<u32> = ctx.prompt_tokens().to_vec();
-        let start_pos = ctx.position();
-        let end_pos =
-            start_pos
-                .checked_add(prompt_tokens.len())
-                .ok_or(K3Error::ContextLengthExceeded {
-                    requested_tokens: usize::MAX,
-                    max_context_tokens: ctx.n_ctx(),
-                })?;
-        if end_pos > ctx.n_ctx() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: end_pos,
-                max_context_tokens: ctx.n_ctx(),
-            });
-        }
-
-        let geom = self.resolve_kv_geometry(ctx)?;
-        let mut workspace = ForwardWorkspace::new(self);
-        {
-            let (logits_buf, kv_buf) = ctx.buffers_mut();
-            let mut kv_view = KvCacheView::new(kv_buf, geom)?;
-
-            for (offset, &token_id) in prompt_tokens.iter().enumerate() {
-                self.forward_token(
-                    token_id,
-                    start_pos + offset,
-                    weights,
-                    &mut kv_view,
-                    &mut workspace,
-                )?;
-            }
-
-            self.write_lm_logits(
-                weights,
-                &workspace.hidden,
-                &mut workspace.normed,
-                logits_buf,
-            )?;
-        }
-        ctx.advance_position(prompt_tokens.len())?;
-        Ok(())
+        self.prefill_step_inner(ctx, weights, None)
     }
 
     fn decode_step(
@@ -1320,36 +1988,6 @@ impl ArchRecipe for Phi3Recipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        self.validate_runtime_geometry()?;
-        let token_id = ctx
-            .decode_token()
-            .ok_or_else(|| K3Error::CapabilityMismatch {
-                architecture: self.architecture.to_owned(),
-                reason: "decode_step requires a decode_token in ExecutionContext".to_owned(),
-            })?;
-        let abs_pos = ctx.position();
-        if abs_pos >= ctx.n_ctx() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: abs_pos.saturating_add(1),
-                max_context_tokens: ctx.n_ctx(),
-            });
-        }
-
-        let geom = self.resolve_kv_geometry(ctx)?;
-        let mut workspace = ForwardWorkspace::new(self);
-        {
-            let (logits_buf, kv_buf) = ctx.buffers_mut();
-            let mut kv_view = KvCacheView::new(kv_buf, geom)?;
-
-            self.forward_token(token_id, abs_pos, weights, &mut kv_view, &mut workspace)?;
-            self.write_lm_logits(
-                weights,
-                &workspace.hidden,
-                &mut workspace.normed,
-                logits_buf,
-            )?;
-        }
-        ctx.advance_position(1)?;
-        Ok(())
+        self.decode_step_inner(ctx, weights, None)
     }
 }
