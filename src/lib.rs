@@ -14,7 +14,7 @@ pub use recipe::{
     PhiStopMetadata, RopeScalingConfig,
 };
 pub use repack::{
-    Phi3LayerRepack, Phi3ModelRepack, Phi3RepackCache, Phi3SplitMatrix,
+    Phi3LayerDescriptor, Phi3LayerRepack, Phi3ModelRepack, Phi3RepackCache, Phi3SplitMatrix,
     REPACK_TILE_ALIGNMENT_BYTES, REPACK_TILE_ROWS,
 };
 
@@ -1574,6 +1574,141 @@ mod tests {
                     assert!((out_full[m_idx * ROWS + r] - single[r]).abs() < 1e-5);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_wave4_scratch_workspace_decode_and_descriptors_miri() {
+        let mut recipe = Phi3Recipe::new();
+        recipe.num_layers = 2;
+        recipe.hidden_dim = 16;
+        recipe.ffn_dim = 20;
+        recipe.n_heads_q = 4;
+        recipe.n_heads_kv = 2;
+        recipe.head_dim = 4;
+        recipe.vocab_size = 12;
+
+        let desc0 = Phi3Recipe::layer_descriptor(0);
+        let desc31 = Phi3Recipe::layer_descriptor(31);
+        assert_eq!(desc0.attn_norm(), "blk.0.attn_norm.weight");
+        assert_eq!(desc31.attn_output(), "blk.31.attn_output.weight");
+        assert_eq!(
+            desc31.post_attention_norm(),
+            "blk.31.post_attention_norm.weight"
+        );
+        assert_eq!(desc31.ffn_down(), "blk.31.ffn_down.weight");
+        assert_eq!(recipe.layer_descriptors().len(), 2);
+
+        let needed = recipe.required_decode_scratch_bytes(4);
+        let mut scratch = jero_core::ScratchWorkspace::new(needed).expect("scratch workspace");
+        let kv_geom = jero_core::KvGeometry::new(
+            recipe.num_layers,
+            recipe.n_heads_kv,
+            recipe.head_dim,
+            4,
+            None,
+        )
+        .expect("kv geometry");
+        let kv_len = kv_geom.required_f32_len().expect("kv f32 len");
+        let empty = TestWeights {
+            tensors: Vec::new(),
+        };
+
+        let mut logits_with_scratch = vec![0.0_f32; recipe.vocab_size];
+        let mut kv_with_scratch = vec![0.0_f32; kv_len];
+        let mut logits_fallback = vec![0.0_f32; recipe.vocab_size];
+        let mut kv_fallback = vec![0.0_f32; kv_len];
+
+        let mut ctx_scratch =
+            ExecutionContext::new(&[], 4, &mut logits_with_scratch, &mut kv_with_scratch)
+                .expect("scratch ctx")
+                .with_kv_geometry(kv_geom)
+                .expect("kv geom")
+                .with_scratch(&mut scratch);
+        ctx_scratch.prepare_decode(1).expect("prep pos 0");
+        recipe
+            .decode_step(&mut ctx_scratch, &empty)
+            .expect("decode pos 0");
+        assert_eq!(
+            ctx_scratch.scratch().expect("scratch").used_bytes(),
+            0,
+            "ScratchScope must rewind cursor on exit"
+        );
+        let peak0 = ctx_scratch.scratch().expect("scratch").peak_used_bytes();
+        assert!(peak0 > 0 && peak0 <= needed);
+
+        ctx_scratch.prepare_decode(3).expect("prep pos 1");
+        recipe
+            .decode_step(&mut ctx_scratch, &empty)
+            .expect("decode pos 1");
+        let scratch_ref = ctx_scratch.scratch().expect("scratch");
+        assert_eq!(scratch_ref.used_bytes(), 0);
+        assert!(scratch_ref.peak_used_bytes() >= peak0);
+
+        let mut ctx_fallback =
+            ExecutionContext::new(&[], 4, &mut logits_fallback, &mut kv_fallback)
+                .expect("fallback ctx")
+                .with_kv_geometry(kv_geom)
+                .expect("fallback geom");
+        ctx_fallback.prepare_decode(1).expect("fallback prep pos 0");
+        recipe
+            .decode_step(&mut ctx_fallback, &empty)
+            .expect("fallback decode pos 0");
+        ctx_fallback.prepare_decode(3).expect("fallback prep pos 1");
+        recipe
+            .decode_step(&mut ctx_fallback, &empty)
+            .expect("fallback decode pos 1");
+
+        for (i, (&a, &b)) in logits_with_scratch.iter().zip(&logits_fallback).enumerate() {
+            #[cfg(not(miri))]
+            assert_eq!(a.to_bits(), b.to_bits(), "logit[{i}] bits mismatch");
+            #[cfg(miri)]
+            {
+                // Miri intentionally jitters low bits of `libm` transcendentals (`sin`, `cos`, `exp`)
+                // across evaluations, so verify tight numeric parity instead of exact bit identity.
+                assert!(
+                    a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-5,
+                    "logit[{i}] miri mismatch: {a} vs {b}"
+                );
+            }
+        }
+
+        let mut tiny_scratch = jero_core::ScratchWorkspace::new(128).expect("tiny scratch");
+        let mut bad_logits = vec![0.0_f32; recipe.vocab_size];
+        let mut bad_kv = vec![0.0_f32; kv_len];
+        let mut bad_ctx = ExecutionContext::new(&[], 4, &mut bad_logits, &mut bad_kv)
+            .expect("bad ctx")
+            .with_kv_geometry(kv_geom)
+            .expect("bad geom")
+            .with_scratch(&mut tiny_scratch);
+        bad_ctx.prepare_decode(0).expect("bad prep");
+        let err = recipe
+            .decode_step(&mut bad_ctx, &empty)
+            .expect_err("undersized ScratchWorkspace must fail closed");
+        assert!(matches!(err, K3Error::TensorBoundsError { .. }));
+    }
+
+    #[test]
+    fn test_wave4_split_matrix_m1_gemv_parallel_miri() {
+        const GEMV_ROWS: usize = 12;
+        const GEMV_COLS: usize = 8;
+        let w_f32: Vec<f32> = (0..GEMV_ROWS * GEMV_COLS)
+            .map(|i| pattern_f32(i, 2, 1, 7, 5.0, 0.09))
+            .collect();
+        let w_bytes: Vec<u8> = w_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tv =
+            TensorView::from_bytes("w_m1", QuantType::F32, &[GEMV_COLS, GEMV_ROWS], 0, &w_bytes)
+                .expect("tv");
+        let split = Phi3SplitMatrix::from_tensor(&tv, GEMV_ROWS, GEMV_COLS).expect("split");
+        let x: Vec<f32> = (0..GEMV_COLS)
+            .map(|i| pattern_f32(i, 1, 0, 5, 4.0, 0.1))
+            .collect();
+        let mut out_seq = [0.0_f32; GEMV_ROWS];
+        let mut out_par = [0.0_f32; GEMV_ROWS];
+        split.gemv(&mut out_seq, &x).expect("seq gemv");
+        split.gemv_parallel(&mut out_par, &x).expect("par gemv");
+        for i in 0..GEMV_ROWS {
+            assert_eq!(out_seq[i].to_bits(), out_par[i].to_bits());
         }
     }
 }

@@ -4,15 +4,19 @@
 //! executes bit-equivalent portable scalar math across `F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`,
 //! `Q8_0`, `Q4_K_M`, `Q5_K`, and `Q6_K` when built with `--no-default-features`.
 
-use jero_core::{K3Error, QuantType, TensorView};
+use jero_core::{K3Error, QuantType, ScratchScope, TensorView};
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    AttentionMaskConfig, BaselineKernel, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
-    Q4_K_M_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
-    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, VectorKernel, bf16_to_f32_finite,
-    dequantize_token_row, f16_to_f32_finite, gqa_causal_attention_f32,
-    gqa_causal_attention_prefill_f32, swiglu_f32, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
+    AttentionMaskConfig, BaselineKernel, BlockQ8_0, BlockQ8K, Q4_0_BLOCK_BYTES,
+    Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES, Q4_K_M_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES,
+    Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMENTS, Q8_K_BLOCK_ELEMENTS, VectorKernel, bf16_to_f32_finite,
+    dequantize_token_row, f16_to_f32_finite, gemv_q4_0_q8_0_4x, gemv_q4_k_q8_k, gemv_q5_0_q8_0_4x,
+    gemv_q5_k_q8_k, gemv_q6_k_q8_k, gemv_q8_0_q8_0_4x, gqa_causal_attention_prefill_f32,
+    gqa_causal_attention_with_scratch_f32, quantize_row_q8_0_f32, quantize_row_q8_0_in_scope,
+    quantize_row_q8_k, quantize_row_q8_k_in_scope, swiglu_f32, vec_dot_bf16, vec_dot_f16,
+    vec_dot_q4_0, vec_dot_q5_0,
 };
 #[cfg(all(feature = "with-kernels", not(miri)))]
 use jero_kernels_rvv::{gqa_causal_attention_prefill_kv_heads_f32, gqa_kv_head_partition};
@@ -402,6 +406,7 @@ fn dequant_block_row_payload<const ELEMS: usize, const BYTES: usize>(
     Ok(())
 }
 
+#[cfg(not(feature = "with-kernels"))]
 fn dot_block_rows<const ELEMS: usize, const BYTES: usize>(
     tensor: &TensorView<'_>,
     rows: usize,
@@ -438,6 +443,34 @@ fn dot_block_rows<const ELEMS: usize, const BYTES: usize>(
     Ok(())
 }
 
+/// Decodes a single 1D normalization tensor (`F32`, `F16`, or `BF16`) into `out` (`expected_len`
+/// elements) without heap allocation.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if element count, output slice length, or byte length
+/// mismatches, or [`K3Error::CapabilityMismatch`] if `tensor.quant()` is not an unquantized
+/// norm format.
+pub(crate) fn decode_1d_norm_into(
+    tensor: &TensorView<'_>,
+    expected_len: usize,
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    if tensor.num_elements() != expected_len || out.len() != expected_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor.name().to_owned(),
+            offset: tensor.offset(),
+            byte_len: tensor.byte_len(),
+            buffer_len: tensor.as_bytes().len(),
+            reason: format!(
+                "norm element count {} (out len {}) != expected hidden_dim {expected_len}",
+                tensor.num_elements(),
+                out.len()
+            ),
+        });
+    }
+    decode_unquant_payload(tensor, tensor.as_bytes(), out)
+}
+
 /// Decodes a single 1D normalization tensor (`F32`, `F16`, or `BF16`) into `expected_len` floats.
 ///
 /// # Errors
@@ -447,20 +480,8 @@ pub(crate) fn decode_1d_norm(
     tensor: &TensorView<'_>,
     expected_len: usize,
 ) -> Result<Vec<f32>, K3Error> {
-    if tensor.num_elements() != expected_len {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: tensor.name().to_owned(),
-            offset: tensor.offset(),
-            byte_len: tensor.byte_len(),
-            buffer_len: tensor.as_bytes().len(),
-            reason: format!(
-                "norm element count {} != expected hidden_dim {expected_len}",
-                tensor.num_elements()
-            ),
-        });
-    }
     let mut out = vec![0.0_f32; expected_len];
-    decode_unquant_payload(tensor, tensor.as_bytes(), &mut out)?;
+    decode_1d_norm_into(tensor, expected_len, &mut out)?;
     Ok(out)
 }
 
@@ -623,9 +644,223 @@ pub(crate) fn dequantize_row_to_f32(
     }
 }
 
-/// Computes `output[0..expected_rows] = weights * input[0..expected_cols]` across all
-/// admitted Phi-3 / Phi-4 quantization types (`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`, `Q8_0`,
-/// `Q4_K_M`, `Q5_K`, `Q6_K`) without silent synthetic fallbacks.
+#[cfg(feature = "with-kernels")]
+const MAX_STACK_Q8_ELEMENTS: usize = 8192;
+#[cfg(feature = "with-kernels")]
+const MAX_STACK_Q8_0_BLOCKS: usize = MAX_STACK_Q8_ELEMENTS / Q8_0_BLOCK_ELEMENTS;
+#[cfg(feature = "with-kernels")]
+const MAX_STACK_Q8_K_BLOCKS: usize = MAX_STACK_Q8_ELEMENTS / Q8_K_BLOCK_ELEMENTS;
+
+/// Reusable stack-first `Q8_0` / `Q8_K` quantized activation buffers for `M = 1` projections
+/// sharing the same input vector (such as split `(Wq, Wk, Wv)` and `(Wgate, Wup)`).
+#[cfg(feature = "with-kernels")]
+pub(crate) struct SharedQ8Input<'a> {
+    input: &'a [f32],
+    q8_0_stack: [BlockQ8_0; MAX_STACK_Q8_0_BLOCKS],
+    q8_0_heap: Vec<BlockQ8_0>,
+    q8_0_len: usize,
+    q8_k_stack: [BlockQ8K; MAX_STACK_Q8_K_BLOCKS],
+    q8_k_heap: Vec<BlockQ8K>,
+    q8_k_len: usize,
+}
+
+#[cfg(feature = "with-kernels")]
+impl<'a> SharedQ8Input<'a> {
+    pub(crate) fn new(input: &'a [f32]) -> Self {
+        Self {
+            input,
+            q8_0_stack: [BlockQ8_0::ZERO; MAX_STACK_Q8_0_BLOCKS],
+            q8_0_heap: Vec::new(),
+            q8_0_len: 0,
+            q8_k_stack: [BlockQ8K::ZERO; MAX_STACK_Q8_K_BLOCKS],
+            q8_k_heap: Vec::new(),
+            q8_k_len: 0,
+        }
+    }
+
+    fn ensure_q8_0(&mut self) -> Result<(), K3Error> {
+        if self.q8_0_len > 0 {
+            return Ok(());
+        }
+        let blocks = self.input.len() / Q8_0_BLOCK_ELEMENTS;
+        if blocks <= MAX_STACK_Q8_0_BLOCKS {
+            quantize_row_q8_0_f32(self.input, &mut self.q8_0_stack[..blocks])?;
+        } else {
+            self.q8_0_heap.resize(blocks, BlockQ8_0::ZERO);
+            quantize_row_q8_0_f32(self.input, &mut self.q8_0_heap)?;
+        }
+        self.q8_0_len = blocks;
+        Ok(())
+    }
+
+    fn ensure_q8_k(&mut self) -> Result<(), K3Error> {
+        if self.q8_k_len > 0 {
+            return Ok(());
+        }
+        let blocks = self.input.len() / Q8_K_BLOCK_ELEMENTS;
+        if blocks <= MAX_STACK_Q8_K_BLOCKS {
+            quantize_row_q8_k(self.input, &mut self.q8_k_stack[..blocks])?;
+        } else {
+            self.q8_k_heap.resize(blocks, BlockQ8K::ZERO);
+            quantize_row_q8_k(self.input, &mut self.q8_k_heap)?;
+        }
+        self.q8_k_len = blocks;
+        Ok(())
+    }
+
+    fn q8_0_slice(&self) -> &[BlockQ8_0] {
+        if self.q8_0_heap.is_empty() {
+            &self.q8_0_stack[..self.q8_0_len]
+        } else {
+            &self.q8_0_heap
+        }
+    }
+
+    fn q8_k_slice(&self) -> &[BlockQ8K] {
+        if self.q8_k_heap.is_empty() {
+            &self.q8_k_stack[..self.q8_k_len]
+        } else {
+            &self.q8_k_heap
+        }
+    }
+}
+
+/// Evaluates `f` over a zero-allocation `[row_start..row_start + row_count)` 2D view normalized
+/// to `[cols, row_count]` without heap allocations.
+pub(crate) fn with_2d_rows_view<R>(
+    tensor: &TensorView<'_>,
+    row_start: usize,
+    row_count: usize,
+    expected_cols: usize,
+    f: impl FnOnce(&TensorView<'_>) -> Result<R, K3Error>,
+) -> Result<R, K3Error> {
+    let (total_rows, cols) = resolve_2d_dims(tensor, expected_cols)?;
+    let row_end = row_start.saturating_add(row_count);
+    if row_count == 0 || row_end > total_rows {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor.name().to_owned(),
+            offset: row_start,
+            byte_len: row_count,
+            buffer_len: total_rows,
+            reason: format!(
+                "row slice [{row_start}..{row_end}) out of bounds for {total_rows} rows"
+            ),
+        });
+    }
+    let row_bytes = quant_row_bytes(cols, tensor.quant())
+        .ok_or_else(|| K3Error::unsupported_tensor_quant("phi3", tensor.name(), tensor.quant()))?;
+    let byte_start = row_start * row_bytes;
+    let byte_end = row_end * row_bytes;
+    let shape = [cols, row_count];
+    let view = TensorView::from_bytes(
+        tensor.name(),
+        tensor.quant(),
+        &shape,
+        0,
+        &tensor.as_bytes()[byte_start..byte_end],
+    )?;
+    f(&view)
+}
+
+/// Dispatches row-partitioned `M = 1` work across active Rayon worker threads with zero heap
+/// allocations and deterministic bit-identical outputs across any worker count (`not(miri)`).
+pub(crate) fn parallel_split_rows<F>(
+    out: &mut [f32],
+    align: usize,
+    min_parallel_rows: usize,
+    op: &F,
+) -> Result<(), K3Error>
+where
+    F: Fn(&mut [f32], usize) -> Result<(), K3Error> + Sync,
+{
+    #[cfg(miri)]
+    {
+        let _ = (align, min_parallel_rows);
+        op(out, 0)
+    }
+    #[cfg(not(miri))]
+    {
+        let step = align.max(1);
+        let workers = rayon::current_num_threads();
+        if workers <= 1 || out.len() < min_parallel_rows.max(step.saturating_mul(2)) {
+            return op(out, 0);
+        }
+        parallel_split_rows_inner(out, 0, step, workers, op)
+    }
+}
+
+#[cfg(not(miri))]
+fn parallel_split_rows_inner<F>(
+    out: &mut [f32],
+    base_row: usize,
+    align: usize,
+    budget_workers: usize,
+    op: &F,
+) -> Result<(), K3Error>
+where
+    F: Fn(&mut [f32], usize) -> Result<(), K3Error> + Sync,
+{
+    let total_units = out.len().div_ceil(align);
+    if budget_workers <= 1 || total_units <= 1 {
+        return op(out, base_row);
+    }
+    let left_workers = budget_workers / 2;
+    let right_workers = budget_workers - left_workers;
+    let left_units = (total_units * left_workers / budget_workers)
+        .max(1)
+        .min(total_units - 1);
+    let mid_rows = left_units * align;
+    let (left_out, right_out) = out.split_at_mut(mid_rows);
+    let (left_res, right_res) = rayon::join(
+        || parallel_split_rows_inner(left_out, base_row, align, left_workers, op),
+        || parallel_split_rows_inner(right_out, base_row + mid_rows, align, right_workers, op),
+    );
+    left_res?;
+    right_res
+}
+
+/// Multi-row `M = 1` parallel LM-head projection dispatching to `gemv_q*_q8_*` multi-row integer
+/// RVV/scalar kernels when `with-kernels` is enabled, or row-parallel scalar math under
+/// `--no-default-features` (`#34`).
+pub(crate) fn project_lm_head_parallel(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+    scope: Option<&ScratchScope<'_>>,
+) -> Result<(), K3Error> {
+    let expected_cols = input.len();
+    let expected_rows = output.len();
+    let (rows, cols) = resolve_2d_dims(weights, expected_cols)?;
+    if rows != expected_rows {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "weight matrix output rows {rows} != expected output len {expected_rows}"
+            ),
+        });
+    }
+
+    #[cfg(feature = "with-kernels")]
+    {
+        project_lm_head_q8_parallel(output, weights, cols, input, scope)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let _ = scope;
+        parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+            with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                project_matvec_scalar(sub_out, sub_view, sub_out.len(), cols, input)
+            })
+        })
+    }
+}
+
+/// Validates shape and computes `output[0..expected_rows] = weights * input[0..expected_cols]`
+/// across all admitted Phi-3 / Phi-4 quantization types (`F32`, `F16`, `BF16`, `Q4_0`, `Q5_0`,
+/// `Q8_0`, `Q4_K_M`, `Q5_K`, `Q6_K`), partitioning output rows across active `WorkerPool` threads.
 ///
 /// # Errors
 /// Returns [`K3Error::TensorBoundsError`] on shape/buffer mismatch or
@@ -652,11 +887,19 @@ pub(crate) fn project_matvec(
 
     #[cfg(feature = "with-kernels")]
     {
-        project_matvec_kernels(output, weights, rows, cols, input)
+        parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+            with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                project_matvec_kernels(sub_out, sub_view, cols, input)
+            })
+        })
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        project_matvec_scalar(output, weights, rows, cols, input)
+        parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+            with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                project_matvec_scalar(sub_out, sub_view, sub_out.len(), cols, input)
+            })
+        })
     }
 }
 
@@ -664,7 +907,6 @@ pub(crate) fn project_matvec(
 fn project_matvec_kernels(
     output: &mut [f32],
     weights: &TensorView<'_>,
-    rows: usize,
     cols: usize,
     input: &[f32],
 ) -> Result<(), K3Error> {
@@ -674,17 +916,190 @@ fn project_matvec_kernels(
         QuantType::Q6_K => BaselineKernel::new().vec_dot_q6_k(output, weights, input),
         QuantType::Q5_K => BaselineKernel::new().vec_dot_q5_k(output, weights, input),
         QuantType::Q4_0 => vec_dot_q4_0(output, weights, input),
+        QuantType::Q5_0 => vec_dot_q5_0(output, weights, input),
         QuantType::F16 => vec_dot_f16(output, weights, input),
         QuantType::BF16 => vec_dot_bf16(output, weights, input),
-        QuantType::Q5_0 => dot_block_rows::<Q5_0_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES>(
-            weights,
-            rows,
-            cols,
-            input,
-            output,
-            dequantize_q5_0_block,
-        ),
-        QuantType::F32 => project_f32_rows(output, weights, rows, cols, input),
+        QuantType::F32 => dot_unquantized_rows(output, weights, output.len(), cols, input),
+        other => Err(K3Error::unsupported_tensor_quant(
+            "phi3",
+            weights.name(),
+            other,
+        )),
+    }
+}
+
+/// Projects `[row_start..row_start + out.len()]` of `weights` against a shared pre-quantized `Q8`
+/// input activation without re-quantizing across split `(Wq, Wk, Wv)` or `(Wgate, Wup)` tensors.
+#[cfg(feature = "with-kernels")]
+pub(crate) fn project_matvec_shared_q8(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    shared: &mut SharedQ8Input<'_>,
+) -> Result<(), K3Error> {
+    let expected_cols = shared.input.len();
+    let (rows, cols) = resolve_2d_dims(weights, expected_cols)?;
+    if rows != output.len() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "weight matrix output rows {rows} != expected output len {}",
+                output.len()
+            ),
+        });
+    }
+    match weights.quant() {
+        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q6_K => {
+            shared.ensure_q8_k()?;
+            let q8_k = shared.q8_k_slice();
+            parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                    dispatch_q8_k_gemv(sub_out, sub_view, q8_k)
+                })
+            })
+        }
+        QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 => {
+            shared.ensure_q8_0()?;
+            let q8_0 = shared.q8_0_slice();
+            parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                    dispatch_q8_0_gemv(sub_out, sub_view, q8_0)
+                })
+            })
+        }
+        _ => {
+            let input = shared.input;
+            parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                    dispatch_unquant_or_f32_gemv(sub_out, sub_view, cols, input)
+                })
+            })
+        }
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn project_lm_head_q8_parallel(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    cols: usize,
+    input: &[f32],
+    scope: Option<&ScratchScope<'_>>,
+) -> Result<(), K3Error> {
+    match weights.quant() {
+        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q6_K => {
+            if let Some(scratch_scope) = scope {
+                let q8_k = quantize_row_q8_k_in_scope(input, scratch_scope)?;
+                return parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                    with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                        dispatch_q8_k_gemv(sub_out, sub_view, q8_k)
+                    })
+                });
+            }
+            let blocks = cols / Q8_K_BLOCK_ELEMENTS;
+            if blocks <= MAX_STACK_Q8_K_BLOCKS {
+                let mut stack = [BlockQ8K::ZERO; MAX_STACK_Q8_K_BLOCKS];
+                let q8_k = &mut stack[..blocks];
+                quantize_row_q8_k(input, q8_k)?;
+                return parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                    with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                        dispatch_q8_k_gemv(sub_out, sub_view, q8_k)
+                    })
+                });
+            }
+            let mut heap = vec![BlockQ8K::ZERO; blocks];
+            quantize_row_q8_k(input, &mut heap)?;
+            parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                    dispatch_q8_k_gemv(sub_out, sub_view, &heap)
+                })
+            })
+        }
+        QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 => {
+            if let Some(scratch_scope) = scope {
+                let q8_0 = quantize_row_q8_0_in_scope(input, scratch_scope)?;
+                return parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                    with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                        dispatch_q8_0_gemv(sub_out, sub_view, q8_0)
+                    })
+                });
+            }
+            let blocks = cols / Q8_0_BLOCK_ELEMENTS;
+            if blocks <= MAX_STACK_Q8_0_BLOCKS {
+                let mut stack = [BlockQ8_0::ZERO; MAX_STACK_Q8_0_BLOCKS];
+                let q8_0 = &mut stack[..blocks];
+                quantize_row_q8_0_f32(input, q8_0)?;
+                return parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                    with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                        dispatch_q8_0_gemv(sub_out, sub_view, q8_0)
+                    })
+                });
+            }
+            let mut heap = vec![BlockQ8_0::ZERO; blocks];
+            quantize_row_q8_0_f32(input, &mut heap)?;
+            parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+                with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                    dispatch_q8_0_gemv(sub_out, sub_view, &heap)
+                })
+            })
+        }
+        _ => parallel_split_rows(output, 4, 8, &|sub_out, row_start| {
+            with_2d_rows_view(weights, row_start, sub_out.len(), cols, |sub_view| {
+                dispatch_unquant_or_f32_gemv(sub_out, sub_view, cols, input)
+            })
+        }),
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn dispatch_q8_k_gemv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    q8_k: &[BlockQ8K],
+) -> Result<(), K3Error> {
+    match weights.quant() {
+        QuantType::Q4_K_M => gemv_q4_k_q8_k(output, weights, q8_k),
+        QuantType::Q5_K => gemv_q5_k_q8_k(output, weights, q8_k),
+        QuantType::Q6_K => gemv_q6_k_q8_k(output, weights, q8_k),
+        other => Err(K3Error::unsupported_tensor_quant(
+            "phi3",
+            weights.name(),
+            other,
+        )),
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn dispatch_q8_0_gemv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    q8_0: &[BlockQ8_0],
+) -> Result<(), K3Error> {
+    match weights.quant() {
+        QuantType::Q4_0 => gemv_q4_0_q8_0_4x(output, weights, q8_0),
+        QuantType::Q5_0 => gemv_q5_0_q8_0_4x(output, weights, q8_0),
+        QuantType::Q8_0 => gemv_q8_0_q8_0_4x(output, weights, q8_0),
+        other => Err(K3Error::unsupported_tensor_quant(
+            "phi3",
+            weights.name(),
+            other,
+        )),
+    }
+}
+
+#[cfg(feature = "with-kernels")]
+fn dispatch_unquant_or_f32_gemv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    cols: usize,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    match weights.quant() {
+        QuantType::F16 => vec_dot_f16(output, weights, input),
+        QuantType::BF16 => vec_dot_bf16(output, weights, input),
+        QuantType::F32 => dot_unquantized_rows(output, weights, output.len(), cols, input),
         other => Err(K3Error::unsupported_tensor_quant(
             "phi3",
             weights.name(),
@@ -702,16 +1117,8 @@ fn project_matvec_scalar(
     input: &[f32],
 ) -> Result<(), K3Error> {
     match weights.quant() {
-        QuantType::F32 => project_f32_rows(output, weights, rows, cols, input),
-        QuantType::F16 | QuantType::BF16 => {
-            let mut row_buf = vec![0.0_f32; cols];
-            let stride = cols * 2;
-            let raw = weights.as_bytes();
-            for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
-                decode_unquant_payload(weights, &raw[r * stride..(r + 1) * stride], &mut row_buf)?;
-                *out_slot = dot_product_f32(&row_buf, input);
-            }
-            Ok(())
+        QuantType::F32 | QuantType::F16 | QuantType::BF16 => {
+            dot_unquantized_rows(output, weights, rows, cols, input)
         }
         QuantType::Q4_0 => dot_block_rows::<Q4_0_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES>(
             weights,
@@ -769,19 +1176,64 @@ fn project_matvec_scalar(
     }
 }
 
-fn project_f32_rows(
+fn dot_unquantized_rows(
     output: &mut [f32],
     weights: &TensorView<'_>,
     rows: usize,
     cols: usize,
     input: &[f32],
 ) -> Result<(), K3Error> {
+    let elem_bytes = match weights.quant() {
+        QuantType::F32 => 4,
+        QuantType::F16 | QuantType::BF16 => 2,
+        other => {
+            return Err(K3Error::unsupported_tensor_quant(
+                "phi3",
+                weights.name(),
+                other,
+            ));
+        }
+    };
+    let stride = cols * elem_bytes;
     let raw = weights.as_bytes();
-    let stride = cols * 4;
-    let mut row_buf = vec![0.0_f32; cols];
+    let required = rows.saturating_mul(stride);
+    if raw.len() < required {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: required,
+            buffer_len: raw.len(),
+            reason: format!(
+                "buffer len {} smaller than required {required} bytes",
+                raw.len()
+            ),
+        });
+    }
+    let mut chunk_buf = [0.0_f32; 256];
     for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
-        decode_unquant_payload(weights, &raw[r * stride..(r + 1) * stride], &mut row_buf)?;
-        *out_slot = dot_product_f32(&row_buf, input);
+        let row_raw = &raw[r * stride..(r + 1) * stride];
+        let mut acc = 0.0_f32;
+        for (chunk_idx, in_chunk) in input[..cols].chunks(chunk_buf.len()).enumerate() {
+            let chunk_elems = in_chunk.len();
+            let byte_start = chunk_idx * chunk_buf.len() * elem_bytes;
+            let byte_end = byte_start + chunk_elems * elem_bytes;
+            decode_unquant_payload(
+                weights,
+                &row_raw[byte_start..byte_end],
+                &mut chunk_buf[..chunk_elems],
+            )?;
+            #[cfg(feature = "with-kernels")]
+            {
+                acc += dot_product_f32(&chunk_buf[..chunk_elems], in_chunk);
+            }
+            #[cfg(not(feature = "with-kernels"))]
+            {
+                for (&w, &x) in chunk_buf[..chunk_elems].iter().zip(in_chunk) {
+                    acc += w * x;
+                }
+            }
+        }
+        *out_slot = acc;
     }
     Ok(())
 }
@@ -859,16 +1311,17 @@ pub(crate) fn swiglu_layer_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Res
     }
 }
 
-/// Computes causal Grouped-Query Attention across `[0..seq_len)` cached KV slots for one query token.
+/// Computes zero-allocation causal Grouped-Query Attention across `[0..seq_len)` cached KV slots
+/// using a caller-supplied `scores_scratch` slice (`len >= seq_len`).
 ///
 /// # Errors
 /// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] on invalid
 /// geometry or buffer dimensions.
 #[expect(
     clippy::too_many_arguments,
-    reason = "matches gqa_causal_attention_f32 kernel ABI directly"
+    reason = "matches gqa_causal_attention_with_scratch_f32 kernel ABI directly"
 )]
-pub(crate) fn gqa_attention_f32(
+pub(crate) fn gqa_attention_with_scratch_f32(
     out: &mut [f32],
     q: &[f32],
     k_cache: &[f32],
@@ -878,11 +1331,21 @@ pub(crate) fn gqa_attention_f32(
     head_dim: usize,
     seq_len: usize,
     scale: f32,
+    scores_scratch: &mut [f32],
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        gqa_causal_attention_f32(
-            out, q, k_cache, v_cache, n_heads_q, n_heads_kv, head_dim, seq_len, scale,
+        gqa_causal_attention_with_scratch_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            seq_len,
+            scale,
+            scores_scratch,
         )
     }
     #[cfg(not(feature = "with-kernels"))]
@@ -907,17 +1370,19 @@ pub(crate) fn gqa_attention_f32(
             || out.len() != q_len
             || k_cache.len() < kv_min
             || v_cache.len() < kv_min
+            || scores_scratch.len() < seq_len
         {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: "gqa_causal_attention".to_owned(),
                 offset: 0,
                 byte_len: size_of_val(q),
-                buffer_len: size_of_val(k_cache),
-                reason: "GQA query or KV cache buffer dimension mismatch".to_owned(),
+                buffer_len: size_of_val(scores_scratch),
+                reason: "GQA query, KV cache, or scores_scratch buffer dimension mismatch"
+                    .to_owned(),
             });
         }
         let group_size = n_heads_q / n_heads_kv;
-        let mut scores = vec![0.0_f32; seq_len];
+        let scores = &mut scores_scratch[..seq_len];
         for h_q in 0..n_heads_q {
             let h_kv = h_q / group_size;
             let q_head = &q[h_q * head_dim..(h_q + 1) * head_dim];
@@ -931,7 +1396,7 @@ pub(crate) fn gqa_attention_f32(
                 }
             }
             let mut sum_exp = 0.0_f32;
-            for sc in &mut scores[..seq_len] {
+            for sc in &mut *scores {
                 let e = (*sc - max_score).exp();
                 *sc = e;
                 sum_exp += e;

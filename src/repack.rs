@@ -9,7 +9,7 @@
 
 #[cfg(feature = "with-kernels")]
 use std::collections::HashMap;
-#[cfg(feature = "with-kernels")]
+use std::fmt;
 use std::ops::Range;
 #[cfg(feature = "with-kernels")]
 use std::sync::{Arc, OnceLock, RwLock};
@@ -17,12 +17,216 @@ use std::sync::{Arc, OnceLock, RwLock};
 use jero_core::{ArchRecipe, K3Error, ModelWeights, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight, gemm_repacked, gemm_repacked_rows};
+use jero_kernels_rvv::{
+    QuantizedActQ8, QuantizedActQ8View, RepackedWeight, gemm_repacked, gemm_repacked_rows,
+    gemv_repacked_rows, gemv_repacked_view_rows,
+};
 
-use crate::quant::{decode_1d_norm, quant_row_bytes, resolve_2d_dims};
+use crate::quant::{decode_1d_norm, parallel_split_rows, quant_row_bytes, resolve_2d_dims};
 #[cfg(not(feature = "with-kernels"))]
 use crate::quant::{dequantize_row_to_f32, project_matvec};
 use crate::recipe::Phi3Recipe;
+
+const LAYER_KEY_CAP: usize = 56;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LayerKeyBuf {
+    bytes: [u8; LAYER_KEY_CAP],
+    len: usize,
+}
+
+impl LayerKeyBuf {
+    const fn format_blk(layer: usize, suffix: &str) -> Self {
+        const DIGITS: [u8; 10] = *b"0123456789";
+        let mut bytes = [0_u8; LAYER_KEY_CAP];
+        let mut idx = 0_usize;
+
+        let prefix = b"blk.";
+        let mut p = 0_usize;
+        while p < prefix.len() && idx < LAYER_KEY_CAP {
+            bytes[idx] = prefix[p];
+            idx += 1;
+            p += 1;
+        }
+
+        let mut rev = [0_u8; 20];
+        let mut dlen = 0_usize;
+        let mut n = layer;
+        if n == 0 {
+            rev[0] = b'0';
+            dlen = 1;
+        } else {
+            while n > 0 && dlen < rev.len() {
+                rev[dlen] = DIGITS[n % 10];
+                n /= 10;
+                dlen += 1;
+            }
+        }
+        while dlen > 0 && idx < LAYER_KEY_CAP {
+            dlen -= 1;
+            bytes[idx] = rev[dlen];
+            idx += 1;
+        }
+
+        if idx < LAYER_KEY_CAP {
+            bytes[idx] = b'.';
+            idx += 1;
+        }
+
+        let sb = suffix.as_bytes();
+        let mut s = 0_usize;
+        while s < sb.len() && idx < LAYER_KEY_CAP {
+            bytes[idx] = sb[s];
+            idx += 1;
+            s += 1;
+        }
+
+        Self { bytes, len: idx }
+    }
+
+    const fn as_str(&self) -> &str {
+        let (head, _) = self.bytes.split_at(self.len);
+        match core::str::from_utf8(head) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
+    }
+}
+
+impl fmt::Debug for LayerKeyBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Pre-formatted stack-allocated per-layer GGUF tensor name descriptor requiring zero heap
+/// allocations or per-token `format!` formatting (`#33`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phi3LayerDescriptor {
+    layer: usize,
+    attn_norm: LayerKeyBuf,
+    ffn_norm: LayerKeyBuf,
+    post_attention_norm: LayerKeyBuf,
+    attn_qkv: LayerKeyBuf,
+    attn_q: LayerKeyBuf,
+    attn_k: LayerKeyBuf,
+    attn_v: LayerKeyBuf,
+    attn_output: LayerKeyBuf,
+    ffn_up: LayerKeyBuf,
+    ffn_gate: LayerKeyBuf,
+    ffn_down: LayerKeyBuf,
+}
+
+impl Phi3LayerDescriptor {
+    /// Builds all canonical transformer block tensor keys for `layer` directly on the stack with
+    /// zero heap allocations.
+    #[must_use]
+    pub const fn for_layer(layer: usize) -> Self {
+        Self {
+            layer,
+            attn_norm: LayerKeyBuf::format_blk(layer, "attn_norm.weight"),
+            ffn_norm: LayerKeyBuf::format_blk(layer, "ffn_norm.weight"),
+            post_attention_norm: LayerKeyBuf::format_blk(layer, "post_attention_norm.weight"),
+            attn_qkv: LayerKeyBuf::format_blk(layer, "attn_qkv.weight"),
+            attn_q: LayerKeyBuf::format_blk(layer, "attn_q.weight"),
+            attn_k: LayerKeyBuf::format_blk(layer, "attn_k.weight"),
+            attn_v: LayerKeyBuf::format_blk(layer, "attn_v.weight"),
+            attn_output: LayerKeyBuf::format_blk(layer, "attn_output.weight"),
+            ffn_up: LayerKeyBuf::format_blk(layer, "ffn_up.weight"),
+            ffn_gate: LayerKeyBuf::format_blk(layer, "ffn_gate.weight"),
+            ffn_down: LayerKeyBuf::format_blk(layer, "ffn_down.weight"),
+        }
+    }
+
+    /// Zero-based transformer block index.
+    #[must_use]
+    pub const fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// Key for `blk.<layer>.attn_norm.weight`.
+    #[must_use]
+    pub const fn attn_norm(&self) -> &str {
+        self.attn_norm.as_str()
+    }
+
+    /// Key for `blk.<layer>.ffn_norm.weight`.
+    #[must_use]
+    pub const fn ffn_norm(&self) -> &str {
+        self.ffn_norm.as_str()
+    }
+
+    /// Key for `blk.<layer>.post_attention_norm.weight`.
+    #[must_use]
+    pub const fn post_attention_norm(&self) -> &str {
+        self.post_attention_norm.as_str()
+    }
+
+    /// Key for `blk.<layer>.attn_qkv.weight`.
+    #[must_use]
+    pub const fn attn_qkv(&self) -> &str {
+        self.attn_qkv.as_str()
+    }
+
+    /// Key for `blk.<layer>.attn_q.weight`.
+    #[must_use]
+    pub const fn attn_q(&self) -> &str {
+        self.attn_q.as_str()
+    }
+
+    /// Key for `blk.<layer>.attn_k.weight`.
+    #[must_use]
+    pub const fn attn_k(&self) -> &str {
+        self.attn_k.as_str()
+    }
+
+    /// Key for `blk.<layer>.attn_v.weight`.
+    #[must_use]
+    pub const fn attn_v(&self) -> &str {
+        self.attn_v.as_str()
+    }
+
+    /// Key for `blk.<layer>.attn_output.weight`.
+    #[must_use]
+    pub const fn attn_output(&self) -> &str {
+        self.attn_output.as_str()
+    }
+
+    /// Key for `blk.<layer>.ffn_up.weight`.
+    #[must_use]
+    pub const fn ffn_up(&self) -> &str {
+        self.ffn_up.as_str()
+    }
+
+    /// Key for `blk.<layer>.ffn_gate.weight`.
+    #[must_use]
+    pub const fn ffn_gate(&self) -> &str {
+        self.ffn_gate.as_str()
+    }
+
+    /// Key for `blk.<layer>.ffn_down.weight`.
+    #[must_use]
+    pub const fn ffn_down(&self) -> &str {
+        self.ffn_down.as_str()
+    }
+
+    #[cfg(feature = "with-kernels")]
+    const fn all_keys(&self) -> [&str; 11] {
+        [
+            self.attn_norm(),
+            self.ffn_norm(),
+            self.post_attention_norm(),
+            self.attn_qkv(),
+            self.attn_q(),
+            self.attn_k(),
+            self.attn_v(),
+            self.attn_output(),
+            self.ffn_up(),
+            self.ffn_gate(),
+            self.ffn_down(),
+        ]
+    }
+}
 
 /// Required byte alignment of packed weight payloads on target hardware tiles.
 pub const REPACK_TILE_ALIGNMENT_BYTES: usize = 128;
@@ -323,6 +527,203 @@ impl Phi3SplitMatrix {
         self.repacked.gemv(out, q_act)
     }
 
+    /// Computes row-sliced single-token GEMV (`[1, cols] x [row_range, cols]^T -> [row_range.len()]`)
+    /// reusing an already-quantized activation (`QuantizedActQ8`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `q_act.m() != 1`, `row_range` is out of bounds,
+    /// or dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemv_quantized_rows(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8,
+        row_range: Range<usize>,
+    ) -> Result<(), K3Error> {
+        gemv_repacked_rows(out, &self.repacked, q_act, row_range)
+    }
+
+    /// Computes row-sliced single-token GEMV (`out = self[row_range] * input`) with either
+    /// repacked `M = 1` kernels (`with-kernels`) or portable scalar math (`--no-default-features`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `row_range` or slice lengths mismatch.
+    pub fn gemv_rows(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        row_range: Range<usize>,
+    ) -> Result<(), K3Error> {
+        #[cfg(feature = "with-kernels")]
+        {
+            let q_act = QuantizedActQ8::quantize_row(input)?;
+            gemv_repacked_rows(out, &self.repacked, &q_act, row_range)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            if row_range.end > self.rows
+                || row_range.start > row_range.end
+                || out.len() != row_range.len()
+                || input.len() != self.cols
+            {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: self.name.clone(),
+                    offset: row_range.start,
+                    byte_len: out.len(),
+                    buffer_len: self.rows,
+                    reason: format!(
+                        "row-sliced GEMV shape mismatch (range={}..{}, rows={}, out={}, in={}, cols={})",
+                        row_range.start,
+                        row_range.end,
+                        self.rows,
+                        out.len(),
+                        input.len(),
+                        self.cols
+                    ),
+                });
+            }
+            let row_bytes = quant_row_bytes(self.cols, self.quant)
+                .ok_or_else(|| K3Error::unsupported_tensor_quant("phi3", &self.name, self.quant))?;
+            let byte_start = row_range.start * row_bytes;
+            let byte_end = row_range.end * row_bytes;
+            let shape = [self.cols, row_range.len()];
+            let view = TensorView::from_bytes(
+                &self.name,
+                self.quant,
+                &shape,
+                0,
+                &self.data[byte_start..byte_end],
+            )?;
+            project_matvec(out, &view, input)
+        }
+    }
+
+    /// Dispatches `REPACK_TILE_ROWS`-aligned row-sliced `M = 1` GEMV across active `WorkerPool`
+    /// threads using recursive `rayon::join` with zero intermediate vector allocations (`#34`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemv_quantized_parallel(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8,
+    ) -> Result<(), K3Error> {
+        let rows = self.rows();
+        if out.len() != rows || q_act.k() != self.cols() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.name.clone(),
+                offset: 0,
+                byte_len: size_of_val(out),
+                buffer_len: rows,
+                reason: format!(
+                    "parallel M=1 GEMV shape mismatch (rows={rows}, out={}, k={}, cols={})",
+                    out.len(),
+                    q_act.k(),
+                    self.cols()
+                ),
+            });
+        }
+        parallel_split_rows(
+            out,
+            REPACK_TILE_ROWS,
+            REPACK_TILE_ROWS * 2,
+            &|sub_out, row_start| {
+                self.gemv_quantized_rows(sub_out, q_act, row_start..row_start + sub_out.len())
+            },
+        )
+    }
+
+    /// Computes row-sliced single-token GEMV (`[1, cols] x [row_range, cols]^T -> [row_range.len()]`)
+    /// over a zero-allocation `ScratchWorkspace`-backed [`QuantizedActQ8View`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `row_range` is out of bounds or dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemv_view_rows(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8View<'_>,
+        row_range: Range<usize>,
+    ) -> Result<(), K3Error> {
+        gemv_repacked_view_rows(out, &self.repacked, q_act, row_range)
+    }
+
+    /// Dispatches `REPACK_TILE_ROWS`-aligned row-sliced `M = 1` GEMV over an arena-backed
+    /// [`QuantizedActQ8View`] across active `WorkerPool` threads with zero heap allocations.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    #[cfg(feature = "with-kernels")]
+    pub fn gemv_view_parallel(
+        &self,
+        out: &mut [f32],
+        q_act: &QuantizedActQ8View<'_>,
+    ) -> Result<(), K3Error> {
+        let rows = self.rows();
+        if out.len() != rows || q_act.k() != self.cols() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: self.name.clone(),
+                offset: 0,
+                byte_len: size_of_val(out),
+                buffer_len: rows,
+                reason: format!(
+                    "parallel M=1 view GEMV shape mismatch (rows={rows}, out={}, k={}, cols={})",
+                    out.len(),
+                    q_act.k(),
+                    self.cols()
+                ),
+            });
+        }
+        parallel_split_rows(
+            out,
+            REPACK_TILE_ROWS,
+            REPACK_TILE_ROWS * 2,
+            &|sub_out, row_start| {
+                self.gemv_view_rows(sub_out, q_act, row_start..row_start + sub_out.len())
+            },
+        )
+    }
+
+    /// Dispatches `REPACK_TILE_ROWS`-aligned row-sliced `M = 1` GEMV from `input` across active
+    /// `WorkerPool` threads with deterministic bit-identical results across worker counts (`#34`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions mismatch.
+    pub fn gemv_parallel(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
+        #[cfg(feature = "with-kernels")]
+        {
+            let q_act = QuantizedActQ8::quantize_row(input)?;
+            self.gemv_quantized_parallel(out, &q_act)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            if out.len() != self.rows || input.len() != self.cols {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: self.name.clone(),
+                    offset: 0,
+                    byte_len: size_of_val(out),
+                    buffer_len: self.rows,
+                    reason: format!(
+                        "parallel M=1 GEMV shape mismatch (rows={}, out={}, in={}, cols={})",
+                        self.rows,
+                        out.len(),
+                        input.len(),
+                        self.cols
+                    ),
+                });
+            }
+            parallel_split_rows(
+                out,
+                REPACK_TILE_ROWS,
+                REPACK_TILE_ROWS * 2,
+                &|sub_out, row_start| {
+                    self.gemv_rows(sub_out, input, row_start..row_start + sub_out.len())
+                },
+            )
+        }
+    }
+
     /// Computes batched multi-token GEMM (`[M, cols] x [rows, cols]^T -> [M, rows]`) from raw
     /// `f32` activations `input` using `A100` `XSMTVDotII` / `RVV` `RepackedWeight` tiles when
     /// `with-kernels` is enabled, or portable scalar math under `--no-default-features`.
@@ -616,6 +1017,7 @@ pub struct Phi3ModelRepack {
     vocab_size: usize,
     layers: Vec<Phi3LayerRepack>,
     output_norm: Vec<f32>,
+    lm_head_name: &'static str,
 }
 
 /// Type alias matching the canonical issue nomenclature (`Phi3RepackCache`).
@@ -645,6 +1047,11 @@ impl Phi3ModelRepack {
 
         let output_norm_view = weights.tensor("output_norm.weight")?;
         let output_norm = decode_1d_norm(&output_norm_view, recipe.hidden_dim)?;
+        let lm_head_name = if weights.contains_tensor("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
 
         Ok(Self {
             architecture: recipe.architecture.to_owned(),
@@ -652,7 +1059,15 @@ impl Phi3ModelRepack {
             vocab_size: recipe.vocab_size,
             layers,
             output_norm,
+            lm_head_name,
         })
+    }
+
+    /// Returns the resolved canonical LM head tensor name (`"output.weight"` or tied
+    /// `"token_embd.weight"`) verified during cache setup.
+    #[must_use]
+    pub const fn lm_head_tensor_name(&self) -> &'static str {
+        self.lm_head_name
     }
 
     /// Returns the recipe architecture tag bound to this cache.
@@ -905,28 +1320,21 @@ fn compute_layer_repack_key(
     weights: &dyn ModelWeights,
 ) -> LayerRepackKey {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    if let Ok(embd) = weights.tensor("token_embd.weight") {
+    if weights.contains_tensor("token_embd.weight")
+        && let Ok(embd) = weights.tensor("token_embd.weight")
+    {
         fnv1a_update(
             &mut hash,
             &(embd.as_bytes().as_ptr() as usize).to_le_bytes(),
         );
         fnv1a_update(&mut hash, &embd.as_bytes().len().to_le_bytes());
     }
-    for suffix in [
-        "attn_norm.weight",
-        "ffn_norm.weight",
-        "post_attention_norm.weight",
-        "attn_qkv.weight",
-        "attn_q.weight",
-        "attn_k.weight",
-        "attn_v.weight",
-        "attn_output.weight",
-        "ffn_up.weight",
-        "ffn_gate.weight",
-        "ffn_down.weight",
-    ] {
-        let name = format!("blk.{layer}.{suffix}");
-        if let Ok(view) = weights.tensor(&name) {
+    let desc = Phi3LayerDescriptor::for_layer(layer);
+    for key in desc.all_keys() {
+        if weights.contains_tensor(key)
+            && let Ok(view) = weights.tensor(key)
+        {
+            fnv1a_update(&mut hash, key.as_bytes());
             hash_tensor_view(&mut hash, &view);
         }
     }
