@@ -3,7 +3,10 @@
 //! `M = 1` GEMV across `1`, `4`, and `8` `WorkerPool` threads including `32k`–`200k` LM heads.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 
 use jero_arch_phi3::{
     PHI4_MINI_VOCAB_SIZE, PHI35_PADDED_VOCAB_SIZE, Phi3LayerDescriptor, Phi3ModelRepack,
@@ -16,19 +19,50 @@ use jero_core::{
 
 struct CountingAllocator;
 
-static ALLOC_TRACKING: AtomicBool = AtomicBool::new(false);
+static MEASURE_LOCK: Mutex<()> = Mutex::new(());
+static ACTIVE_TRACKING_GEN: AtomicU64 = AtomicU64::new(0);
+static NEXT_TRACKING_GEN: AtomicU64 = AtomicU64::new(1);
 static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static TRACKED_THREAD_STATE: Cell<(u64, Option<ThreadId>)> = const { Cell::new((0, None)) };
+}
+
+fn register_current_thread(tracking_gen: u64) -> ThreadId {
+    let tid = std::thread::current().id();
+    TRACKED_THREAD_STATE.with(|state| state.set((tracking_gen, Some(tid))));
+    tid
+}
+
+fn clear_current_thread() {
+    let _ = TRACKED_THREAD_STATE.try_with(|state| state.set((0, None)));
+}
+
+fn should_track_current_thread() -> bool {
+    let active_gen = ACTIVE_TRACKING_GEN.load(Ordering::SeqCst);
+    if active_gen == 0 {
+        return false;
+    }
+    TRACKED_THREAD_STATE
+        .try_with(|state| {
+            let (thread_gen, thread_id) = state.get();
+            thread_gen == active_gen && thread_id.is_some()
+        })
+        .unwrap_or(false)
+}
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 // SAFETY: Every allocator method delegates strictly to `std::alloc::System` with identical
-// `Layout` and pointer provenance invariants, updating atomic counters only when `ALLOC_TRACKING`
-// is armed for single-test instrumentation.
+// `Layout` and pointer provenance invariants, updating atomic counters only when the current
+// thread's TLS tracking generation and `ThreadId` match `ACTIVE_TRACKING_GEN`. Because TLS uses
+// `const`-initialized `!Drop` storage and is populated outside `GlobalAlloc`, unregistered
+// `libtest`, coverage-runtime, and background threads are ignored without re-entering `GlobalAlloc`.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ALLOC_TRACKING.load(Ordering::SeqCst) {
+        if should_track_current_thread() {
             ALLOC_BYTES.fetch_add(layout.size(), Ordering::SeqCst);
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
@@ -37,7 +71,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if ALLOC_TRACKING.load(Ordering::SeqCst) {
+        if should_track_current_thread() {
             ALLOC_BYTES.fetch_add(layout.size(), Ordering::SeqCst);
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
@@ -51,7 +85,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ALLOC_TRACKING.load(Ordering::SeqCst) {
+        if should_track_current_thread() {
             ALLOC_BYTES.fetch_add(new_size, Ordering::SeqCst);
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
@@ -60,14 +94,51 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+struct TrackingGuard;
+
+impl Drop for TrackingGuard {
+    fn drop(&mut self) {
+        ACTIVE_TRACKING_GEN.store(0, Ordering::SeqCst);
+        clear_current_thread();
+    }
+}
+
 fn measure_allocs<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
+    let _lock = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tracking_gen = NEXT_TRACKING_GEN.fetch_add(1, Ordering::SeqCst);
+    let _active_tid = register_current_thread(tracking_gen);
     ALLOC_BYTES.store(0, Ordering::SeqCst);
     ALLOC_COUNT.store(0, Ordering::SeqCst);
-    ALLOC_TRACKING.store(true, Ordering::SeqCst);
+    let guard = TrackingGuard;
+    ACTIVE_TRACKING_GEN.store(tracking_gen, Ordering::SeqCst);
     let result = f();
-    ALLOC_TRACKING.store(false, Ordering::SeqCst);
+    drop(guard);
     let bytes = ALLOC_BYTES.load(Ordering::SeqCst);
     let count = ALLOC_COUNT.load(Ordering::SeqCst);
+    (result, bytes, count)
+}
+
+fn measure_allocs_in_pool<R: Send>(
+    pool: &rayon::ThreadPool,
+    f: impl FnOnce() -> R + Send,
+) -> (R, usize, usize) {
+    let _lock = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tracking_gen = NEXT_TRACKING_GEN.fetch_add(1, Ordering::SeqCst);
+    let registered = pool.broadcast(|_| register_current_thread(tracking_gen));
+    assert_eq!(registered.len(), pool.current_num_threads());
+    ALLOC_BYTES.store(0, Ordering::SeqCst);
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    let guard = TrackingGuard;
+    ACTIVE_TRACKING_GEN.store(tracking_gen, Ordering::SeqCst);
+    let result = pool.install(f);
+    drop(guard);
+    let bytes = ALLOC_BYTES.load(Ordering::SeqCst);
+    let count = ALLOC_COUNT.load(Ordering::SeqCst);
+    pool.broadcast(|_| clear_current_thread());
     (result, bytes, count)
 }
 
@@ -539,6 +610,33 @@ fn check_authentic_decode_zero_alloc_steady_state() {
             assert_eq!(ctx.scratch().expect("scratch").used_bytes(), 0);
         }
     }
+
+    let pool = build_warmed_pool(4);
+    let mut scratch = ScratchWorkspace::new(needed).expect("scratch");
+    let mut logits = vec![0.0_f32; recipe.vocab_size];
+    let mut kv = vec![0.0_f32; kv_len];
+    pool.install(|| {
+        let mut ctx = ExecutionContext::new(&[], max_seq, &mut logits, &mut kv)
+            .expect("ctx")
+            .with_kv_geometry(kv_geom)
+            .expect("geom")
+            .with_scratch(&mut scratch);
+        ctx.prepare_decode(5).expect("prep pool warmup");
+        recipe
+            .decode_step_with_repack(&mut ctx, &weights, &repack_cache)
+            .expect("pool warmup repack decode");
+        ctx.prepare_decode(17).expect("prep pool steady-state");
+        let (res, bytes, count) = measure_allocs_in_pool(&pool, || {
+            recipe.decode_step_with_repack(&mut ctx, &weights, &repack_cache)
+        });
+        res.expect("pool steady-state repack decode");
+        assert_eq!(
+            bytes, 0,
+            "parallel repack decode allocated {bytes} heap bytes"
+        );
+        assert_eq!(count, 0);
+        assert_eq!(ctx.scratch().expect("scratch").used_bytes(), 0);
+    });
 }
 
 fn check_deterministic_1_4_8_worker_decode_parity() {
@@ -649,7 +747,7 @@ fn check_200k_lm_head_parallel_decode_parity_and_zero_alloc() {
 
                 ctx.prepare_decode(42).expect("prep step");
                 let (res, bytes, count) =
-                    measure_allocs(|| lm_recipe.decode_step(&mut ctx, &lm_weights));
+                    measure_allocs_in_pool(&pool, || lm_recipe.decode_step(&mut ctx, &lm_weights));
                 res.expect("steady-state large-vocab decode");
                 assert_eq!(
                     bytes, 0,
@@ -714,8 +812,8 @@ fn check_split_matrix_m1_parallel_parity() {
             }
             par_view.fill(0.0);
             pool.install(|| {
-                let scope = act_scratch.scope();
-                let (view_res, alloc_bytes, alloc_count) = measure_allocs(|| {
+                let (view_res, alloc_bytes, alloc_count) = measure_allocs_in_pool(&pool, || {
+                    let scope = act_scratch.scope();
                     let q_act =
                         jero_kernels_rvv::QuantizedActQ8View::quantize_row_in_scope(&x, &scope)?;
                     mat.gemv_view_parallel(&mut par_view, &q_act)
@@ -737,10 +835,65 @@ fn check_split_matrix_m1_parallel_parity() {
     }
 }
 
+fn check_counting_allocator_ignores_off_thread_noise() {
+    let stop_noise = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_noise);
+    let started_clone = Arc::clone(&started);
+
+    let noise_handle = std::thread::spawn(move || {
+        started_clone.store(true, Ordering::Release);
+        while !stop_clone.load(Ordering::Acquire) {
+            let buf = Vec::<u8>::with_capacity(900);
+            std::hint::black_box(buf.capacity());
+            std::thread::yield_now();
+        }
+    });
+    while !started.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let (val, bytes, count) = measure_allocs(|| 42_usize);
+    assert_eq!(val, 42);
+    assert_eq!(
+        bytes, 0,
+        "off-thread noise polluted single-thread measurement"
+    );
+    assert_eq!(count, 0);
+
+    let (cap, alloc_bytes, alloc_count) =
+        measure_allocs(|| Vec::<u8>::with_capacity(128).capacity());
+    assert!(cap >= 128);
+    assert!(alloc_bytes >= 128);
+    assert!(alloc_count >= 1);
+
+    let pool = build_warmed_pool(4);
+    let ((a, b), pool_bytes, pool_count) =
+        measure_allocs_in_pool(&pool, || rayon::join(|| 1_usize, || 2_usize));
+    assert_eq!((a, b), (1, 2));
+    assert_eq!(pool_bytes, 0, "off-pool noise polluted pool measurement");
+    assert_eq!(pool_count, 0);
+
+    let ((cap_a, cap_b), pool_alloc_bytes, pool_alloc_count) =
+        measure_allocs_in_pool(&pool, || {
+            rayon::join(
+                || Vec::<u8>::with_capacity(128).capacity(),
+                || Vec::<u8>::with_capacity(256).capacity(),
+            )
+        });
+    assert!(cap_a >= 128 && cap_b >= 256);
+    assert!(pool_alloc_bytes >= 384);
+    assert!(pool_alloc_count >= 2);
+
+    stop_noise.store(true, Ordering::Release);
+    noise_handle.join().expect("join noise thread");
+}
+
 /// Single sequential test runner inside this binary so `#[global_allocator]` never observes
 /// `libtest` main-thread test-spawning or parallel sibling-test allocations.
 #[test]
 fn test_wave4_zero_alloc_decode_and_gemv_suite() {
+    check_counting_allocator_ignores_off_thread_noise();
     check_layer_descriptors_and_synthetic_decode_zero_alloc();
     check_authentic_decode_zero_alloc_steady_state();
     check_deterministic_1_4_8_worker_decode_parity();
