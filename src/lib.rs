@@ -498,6 +498,78 @@ mod tests {
         assert!(Phi3Recipe::from_gguf(&g_bad).is_err());
     }
 
+    #[cfg(feature = "with-kernels")]
+    fn quantized_reference_dot(quant: QuantType, raw_row: &[u8], x: &[f32]) -> Option<f32> {
+        match quant {
+            QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 => {
+                let mut x_q8 = vec![jero_kernels_rvv::BlockQ8_0::ZERO; x.len() / 32];
+                jero_kernels_rvv::quantize_row_q8_0_f32(x, &mut x_q8).expect("quantize Q8_0");
+                let dot = match quant {
+                    QuantType::Q4_0 => jero_kernels_rvv::vec_dot_q4_0_q8_0(raw_row, &x_q8),
+                    QuantType::Q5_0 => jero_kernels_rvv::vec_dot_q5_0_q8_0_blocks(raw_row, &x_q8),
+                    QuantType::Q8_0 => jero_kernels_rvv::vec_dot_q8_0_q8_0(raw_row, &x_q8),
+                    _ => unreachable!(),
+                }
+                .expect("Q8_0 reference dot");
+                Some(dot)
+            }
+            QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q6_K => {
+                let mut x_q8k = vec![jero_kernels_rvv::BlockQ8K::ZERO; x.len() / 256];
+                jero_kernels_rvv::quantize_row_q8_k(x, &mut x_q8k).expect("quantize Q8_K");
+                let dot = match quant {
+                    QuantType::Q4_K_M => jero_kernels_rvv::vec_dot_q4_k_q8_k(raw_row, &x_q8k),
+                    QuantType::Q5_K => jero_kernels_rvv::vec_dot_q5_k_q8_k(raw_row, &x_q8k),
+                    QuantType::Q6_K => jero_kernels_rvv::vec_dot_q6_k_q8_k(raw_row, &x_q8k),
+                    _ => unreachable!(),
+                }
+                .expect("Q8K reference dot");
+                Some(dot)
+            }
+            _ => None,
+        }
+    }
+
+    fn assert_admitted_quant_projection_parity(
+        label: &str,
+        quant: QuantType,
+        bytes: &[u8],
+        x: &[f32],
+        proj: f32,
+        ref_dot: f32,
+    ) {
+        #[cfg(feature = "with-kernels")]
+        if let Some(q8_ref) = quantized_reference_dot(quant, bytes, x) {
+            let bound = ref_dot.abs() * 0.02 + 0.05;
+            assert!(
+                (q8_ref - ref_dot).abs() <= bound,
+                "{label} Q8 quantization delta exceeded bound: q8_ref={q8_ref} ref={ref_dot} bound={bound}"
+            );
+            #[cfg(all(target_arch = "riscv64", not(miri)))]
+            {
+                // On native `riscv64 +v`, quantized `project_matvec` paths quantize `x` on
+                // the fly to `BlockQ8_0` / `BlockQ8K` before executing RVV integer dot kernels.
+                let q8_tol = 1e-4_f32.max(1e-5_f32 * q8_ref.abs());
+                assert!(
+                    (proj - q8_ref).abs() < q8_tol,
+                    "{label} Q8 parity mismatch: proj={proj} q8_ref={q8_ref}"
+                );
+                assert!(
+                    (proj - ref_dot).abs() <= bound,
+                    "{label} dot quantization delta exceeded bound: proj={proj} ref={ref_dot} bound={bound}"
+                );
+                return;
+            }
+        }
+
+        #[cfg(not(feature = "with-kernels"))]
+        let _ = (quant, bytes, x);
+
+        assert!(
+            (proj - ref_dot).abs() < 1e-4,
+            "{label} dot parity mismatch: proj={proj} ref={ref_dot}"
+        );
+    }
+
     #[test]
     fn test_all_admitted_quants_embedding_and_projection_parity() {
         const COLS: usize = 256;
@@ -591,11 +663,7 @@ mod tests {
             let mut proj = [0.0_f32; 1];
             quant::project_matvec(&mut proj, &tv, &x)
                 .unwrap_or_else(|e| panic!("{label} project failed: {e:?}"));
-            assert!(
-                (proj[0] - ref_dot).abs() < 1e-4,
-                "{label} dot parity mismatch: proj={} ref={ref_dot}",
-                proj[0]
-            );
+            assert_admitted_quant_projection_parity(label, quant, &bytes, &x, proj[0], ref_dot);
             assert!(
                 decoded.iter().any(|&v| v.abs() > 1e-6),
                 "{label} decoded row unexpectedly all zeros"
